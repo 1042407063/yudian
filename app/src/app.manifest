@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="Yudian.PeripheralBattery" version="1.0.0.0"
+                    processorArchitecture="*"/>
+  <description>余电 - 外设电量托盘工具</description>
+
+  <!-- 现代通用控件（菜单/滚动条等系统绘制的部分跟着系统主题走） -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0" processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- 声明支持 Win10/11：不声明的话系统会按兼容模式画右键菜单——
+       表现就是方角 + 1px 硬边，和 Win11 的圆角浮层完全两个年代。 -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- 只声明 Win10 / Win11：程序用到 SetProcessDpiAwarenessContext 等
+           Win10 1607 才有的 API，Win7/8 根本起不来，写上去反而是假承诺。 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/> <!-- Windows 10 / 11 -->
+    </application>
+  </compatibility>
+
+  <!-- 高分屏按显示器各自缩放（程序里也会调一次，这里声明是为了启动瞬间就不糊） -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

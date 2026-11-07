@@ -1,0 +1,56 @@
+# 编译产物（可重新生成，不进仓库）
+app/build/
+*.exe
+*.o
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Python 缓存（dev/probes）
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 运行时 / 本地状态
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+
+# WorkBuddy 本地状态与历史备份
+.workbuddy/settings.local.json
+.workbuddy/tmp/
+.workbuddy/backup/
+.workbuddy/trash/
+
+# 密钥与本地环境
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ===== AI / agent 工具过程文件（预防性规则，路径不存在也生效）=====
+# 注意：.workbuddy/memory/ 是有意保留的项目日志，不要整目录忽略 .workbuddy/
+.workbuddy/cache/
+.workbuddy/logs/
+.workbuddy/sessions/
+.zcode/
+.deepseek/
+.harness/
+.codebuddy/
+.claude/
+.cursor/
+.trae/
+.aider/
+.roo/
+.windsurf/
+_scratch/
+.ai-tmp/
+*.bak
+*~
