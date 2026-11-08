@@ -625,24 +625,42 @@ void DrawContent(Graphics& g, int w, int h) {
                 } else {
                     meta += d.StatusText() + L" · 上次 " + d.AgeText();
                 }
+                // 只有电压的设备必须写清百分比从哪来：G913/G915 用的是 G HUB
+                // 官方曲线（和官方软件同源），其余罗技型号用通用表。
+                // 设备自报的（迈从 / 飞智 / 索尼等）两者都不标。
+                if (d.level >= 0) {
+                    // 面板一行放不下「G HUB 官方曲线」，缩写；全称在 detail 里。
+                    if (d.officialCurve) meta += L" · 官方曲线";
+                    else if (d.approximate) meta += L" · 电压估算";
+                }
                 DrawStr(g, meta, fMeta, g_colors.sub,
                         RectF((float)S(56), top + (float)S(35), textW, (float)S(15)),
                         StringAlignmentNear, StringAlignmentCenter, true, alpha);
 
-                // 颜色只在低电量出现，其余单色——苹果的做法
+                // 颜色只在两种情况下出现：低电量告警、充电中。
+                // 充电中整行电量（数字 + 电池胶囊）用绿色 g_colors.ok，
+                // 优先级高于低电量红/橙——插着线就不该报低电量。
                 uint32_t lvlInk = (!d.online || d.level < 0)
                                       ? g_colors.sub
-                                      : (d.level <= 10
-                                             ? g_colors.critical
-                                             : (d.level <= 20 ? g_colors.low
-                                                              : g_colors.text));
+                                      : (d.charging == 1
+                                             ? g_colors.ok
+                                             : (d.level <= 10
+                                                    ? g_colors.critical
+                                                    : (d.level <= 20 ? g_colors.low
+                                                                     : g_colors.text)));
 
                 // 右边界固定在 pctX + pctW，但把矩形向左放宽 S(16)：
-                // 「100%」比「94%」宽约 8px，按两位数留宽会把百分号裁掉
-                DrawStr(g, d.level >= 0 ? (std::to_wstring(d.level) + L"%") : L"--",
-                        fPct, lvlInk,
-                        RectF(pctX - (float)S(16), top + (float)S(21),
-                              pctW + (float)S(16), (float)S(22)),
+                // 「100%」比「94%」宽约 8px，按两位数留宽会把百分号裁掉。
+                // 估算值多一个「≈」，再往左借 S(8)。
+                // 官方曲线不加「≈」：数值与 G HUB 同源，加了反而像我们自己猜的。
+                bool showApprox = d.approximate && !d.officialCurve;
+                std::wstring pctText = d.level >= 0
+                    ? ((showApprox ? L"≈" : L"") + std::to_wstring(d.level) + L"%")
+                    : L"--";
+                float pctExtra = showApprox ? (float)S(8) : 0.0f;
+                DrawStr(g, pctText, fPct, lvlInk,
+                        RectF(pctX - (float)S(16) - pctExtra, top + (float)S(21),
+                              pctW + (float)S(16) + pctExtra, (float)S(22)),
                         StringAlignmentFar, StringAlignmentCenter, false, alpha);
 
                 float pillY = top + ((float)S(ROW_H) - pillH) / 2.0f;
@@ -1843,7 +1861,10 @@ std::wstring BuildTooltip() {
         s += L"\n";
         s += d.name;
         s += L"  ";
-        s += (d.level >= 0) ? (std::to_wstring(d.level) + L"%") : L"--";
+        s += (d.level >= 0)
+                 ? ((d.approximate && !d.officialCurve ? L"≈" : L"") +
+                    std::to_wstring(d.level) + L"%")
+                 : L"--";
         if (!d.online) s += L"（休眠）";
         else if (d.charging == 1) s += L"（充电中）";
     }

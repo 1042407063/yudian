@@ -202,8 +202,12 @@ int RunListToFile(const wchar_t* path) {
     fprintf(f, "devices=%d\n", (int)list.size());
     for (auto& d : list) {
         std::wstring line = d.name + L" | " + KindLabel(d.kind) + L" | " +
-                            (d.level >= 0 ? std::to_wstring(d.level) + L"%" : L"--") + L" | " +
+                            (d.level >= 0
+                                 ? (d.approximate && !d.officialCurve ? L"≈" : L"") +
+                                       std::to_wstring(d.level) + L"%"
+                                 : L"--") + L" | " +
                             d.transport + L" | " + d.StatusText() + L" | " + d.provider;
+        if (!d.detail.empty()) line += L" | " + d.detail;
         fprintf(f, "%s\n", WideToUtf8(line).c_str());
     }
     fclose(f);

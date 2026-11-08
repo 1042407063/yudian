@@ -92,6 +92,105 @@ void RunCases() {
     // 原始值落在声明区间之外。
     Check(L"Decode out of range value rejected",
           !DecodeBatteryReport(Bytes({0x00, 200}), Field(0, 8, 0, 100), &level, &raw));
+
+    // ---------------------------------------------- 罗技 0x1001：电压字节序
+    // G913 TKL 实测回帧 0F 6C 00 = 3948 mV（大端）。旧实现按小端读成
+    // 0x6C0F = 27663 mV 被丢弃，整台键盘显示「未提供电量接口」。
+    Check(L"LogiVoltage 0F6C is 3948 mV (big endian)",
+          DecodeLogitechVoltage(0x0F, 0x6C) == 3948);
+    Check(L"LogiVoltage 1004 is 4100 mV",
+          DecodeLogitechVoltage(0x10, 0x04) == 4100);
+    Check(L"LogiVoltage falls back to little endian when BE implausible",
+          DecodeLogitechVoltage(0x6C, 0x0F) == 3948);
+    Check(L"LogiVoltage rejects garbage (0,0)",
+          DecodeLogitechVoltage(0x00, 0x00) == -1);
+    Check(L"LogiVoltage prefers big endian when both orders plausible",
+          DecodeLogitechVoltage(0x0F, 0x10) == 3856);
+
+    // ---------------------------------------------- 罗技电压曲线（内核 100 点表）
+    Check(L"LogiCurve 4186 mV -> 100%", LogitechVoltageToPercent(4186) == 100);
+    Check(L"LogiCurve above full clamps to 100%", LogitechVoltageToPercent(4200) == 100);
+    Check(L"LogiCurve 3948 mV -> 73%", LogitechVoltageToPercent(3948) == 73);
+    Check(L"LogiCurve 3949 mV -> 74%", LogitechVoltageToPercent(3949) == 74);
+    Check(L"LogiCurve 3811 mV -> 50%", LogitechVoltageToPercent(3811) == 50);
+    Check(L"LogiCurve 3717 mV -> 20%", LogitechVoltageToPercent(3717) == 20);
+    Check(L"LogiCurve 3537 mV -> 1%", LogitechVoltageToPercent(3537) == 1);
+    Check(L"LogiCurve 3536 mV -> 0%", LogitechVoltageToPercent(3536) == 0);
+    Check(L"LogiCurve 3500 mV -> 0%", LogitechVoltageToPercent(3500) == 0);
+    Check(L"LogiCurve rejects out-of-range voltage", LogitechVoltageToPercent(20000) == -1);
+    Check(L"LogiCurve rejects zero voltage", LogitechVoltageToPercent(0) == -1);
+
+    // ---------------------------------------------- 充电状态：不能把端电压当开路电压
+    // 实测 G913 TKL：放电 3948 mV / flags 0x00 → 插线 4133 mV / flags 0x80。
+    // 旧逻辑直接套放电曲线 = 73% → 97%，插线瞬间凭空涨 24 个点。
+    // 充放电共用同一条曲线。旧实现按状态扣 185mV，充电末期把 99% 压成 75%，
+    // 拔线不扣又弹回 99%——这 19 点断层是人为制造的，必须不再复现。
+    Check(L"LogiBattery 3948 mV -> 73%",
+          LogitechBatteryPercent(3948, false) == 73);
+    Check(L"LogiBattery 4133 mV -> 97% (same curve, no state offset)",
+          LogitechBatteryPercent(4133, false) == 97);
+    Check(L"LogiBattery 4179 mV -> 99%",
+          LogitechBatteryPercent(4179, false) == 99);
+    Check(L"LogiBattery full flag calibrates to 100%",
+          LogitechBatteryPercent(4000, true) == 100);
+    Check(L"LogiBattery rejects invalid voltage",
+          LogitechBatteryPercent(0, false) == -1);
+
+    // ---------------------------------------------- G913 官方 PowerModel（与 G HUB 同源）
+    // 放电表：3948mV 官方 76.4%，4200mV 100%，3800mV 49.5%
+    Check(L"G913 discharge 3948 mV -> 76%", LogitechDischargePercent(3948) == 76);
+    Check(L"G913 discharge 4200 mV -> 100%", LogitechDischargePercent(4200) == 100);
+    Check(L"G913 discharge 3800 mV -> 50%", LogitechDischargePercent(3800) == 50);
+    Check(L"G913 discharge clamps below table -> 0%", LogitechDischargePercent(3300) == 0);
+    // 充电表是独立的一条：4133mV 官方 83.3%，4179mV 88.9%，表顶 4.20V = 91%
+    Check(L"G913 charging 4133 mV -> 83%", LogitechChargingPercent(4133) == 83);
+    Check(L"G913 charging 4179 mV -> 89%", LogitechChargingPercent(4179) == 89);
+    Check(L"G913 charging clamps at 4.20V -> 91%", LogitechChargingPercent(4250) == 91);
+    Check(L"G913 charging rejects invalid voltage", LogitechChargingPercent(0) == -1);
+    // 官方 charging_time_slots equation_coefficiency=150：每 150 秒涨 1%
+    Check(L"G913 trickle +1% after 150s", LogitechTrickleLevel(91, 150000) == 92);
+    Check(L"G913 trickle +4% after 10min", LogitechTrickleLevel(91, 600000) == 95);
+    Check(L"G913 trickle clamps at 100%", LogitechTrickleLevel(99, 3600000) == 100);
+    Check(L"G913 trickle rejects invalid base", LogitechTrickleLevel(-1, 0) == -1);
+
+    // ---------------------------------------------- 估算值速率限制
+    Check(L"Smooth blocks a 24-point plug-in jump", SmoothEstimatedLevel(73, 97, 120000) == 79);
+    Check(L"Smooth blocks a 13-point unplug drop", SmoothEstimatedLevel(73, 60, 120000) == 67);
+    Check(L"Smooth passes normal small change", SmoothEstimatedLevel(73, 75, 120000) == 75);
+    Check(L"Smooth bypasses after 31 minutes offline",
+          SmoothEstimatedLevel(73, 97, 31ULL * 60 * 1000) == 97);
+    Check(L"Smooth with no history uses new value", SmoothEstimatedLevel(-1, 55, 0) == 55);
+
+    // ---------------------------------------------- 双模外设：有线 + 无线去重
+    auto Dup = [](const wchar_t* transport, int level, int charging) {
+        Reading r;
+        r.key = transport;
+        r.name = L"MCHOSE A5 V3 Pro";
+        r.kind = Kind::Mouse;
+        r.provider = L"mchose";
+        r.transport = transport;
+        r.level = level;
+        r.charging = charging;
+        return r;
+    };
+    {
+        std::vector<Reading> v = {Dup(L"2.4G 接收器", 78, 0), Dup(L"USB 有线", 80, 1)};
+        MergeWiredWirelessDuplicates(&v);
+        Check(L"Dup wired+wireless same mouse merges to one row", v.size() == 1);
+        Check(L"Dup keeps the charging row",
+              v.size() == 1 && v[0].charging == 1 && v[0].level == 80);
+    }
+    {
+        std::vector<Reading> v = {Dup(L"2.4G 接收器", 78, 0), Dup(L"2.4G 接收器", 55, 0)};
+        MergeWiredWirelessDuplicates(&v);
+        Check(L"Dup two wireless same-model devices stay separate", v.size() == 2);
+    }
+    {
+        std::vector<Reading> v = {Dup(L"2.4G 接收器", 78, 0), Dup(L"USB 有线", 80, 1)};
+        v[1].name = L"MCHOSE K99 V2";
+        MergeWiredWirelessDuplicates(&v);
+        Check(L"Dup different names are not merged", v.size() == 2);
+    }
 }
 
 }  // namespace

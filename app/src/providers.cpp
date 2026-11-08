@@ -6,6 +6,7 @@
 #include "app.h"
 #include "hid.h"
 #include "decode.h"
+#include "logitech_powermodel.h"   // G913 TKL 官方充放电曲线（取自 G HUB 资源）
 
 #include <setupapi.h>
 #include <bthledef.h>
@@ -55,6 +56,8 @@ constexpr uint8_t FUNC_GET_PROTOCOL = 0x01;
 constexpr uint16_t FEAT_DEVICE_NAME = 0x0005;
 constexpr uint16_t FEAT_BATTERY_LEVEL_STATUS = 0x1000;
 constexpr uint16_t FEAT_BATTERY_VOLTAGE = 0x1001;
+// 官方 charging_time_slots 的稳定判定电压：到 4100mV 以上才启动涓流计时。
+constexpr int kLogiTrickleStartMv = 4100;
 
 std::wstring Lower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
@@ -105,6 +108,17 @@ Kind ClassifyName(const std::wstring& name) {
     for (auto w : kb) if (n.find(w) != std::wstring::npos) return Kind::Keyboard;
     for (auto w : hs) if (n.find(w) != std::wstring::npos) return Kind::Headset;
     return Kind::Other;
+}
+
+// 0x0005 报的是完整市场名。G913 TKL 会回 58 字符的
+// "G913 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard"，面板里只剩省略号。
+// 在 " LIGHTSPEED" 处截断，保留能认出的型号；不含这个词的设备名原样返回。
+std::wstring ShortDeviceName(const std::wstring& name) {
+    size_t pos = Lower(name).find(L" lightspeed");
+    if (pos == std::wstring::npos) return name;
+    std::wstring s = name.substr(0, pos);
+    while (!s.empty() && s.back() == L' ') s.pop_back();
+    return s.empty() ? name : s;
 }
 
 std::wstring StripSuffix(const std::wstring& path, const wchar_t* marker) {
@@ -249,9 +263,15 @@ public:
         return w;
     }
 
-    // 返回 false 表示特性都不支持
-    bool Battery(uint8_t devIdx, int* level, int* voltage, int* charging, std::wstring* status) {
+    // 返回 false 表示两种电量特性都不支持。
+    // 0x1000 给的是设备自报百分比；0x1001 只有大端电压 + 充电标志（G913 TKL
+    // 这类 G 系列键盘压根没有 0x1000），此时用罗技电压曲线估算百分比并置 estimated。
+    // useOfficialCurve = true 时用 G913 TKL 的官方充放电曲线（G HUB PowerModel），
+    // 否则退回内核通用曲线。两条曲线差得很远：4133mV 充电时官方 83%、通用表 97%。
+    bool Battery(uint8_t devIdx, int* level, int* voltage, int* charging,
+                 std::wstring* status, bool* estimated, bool useOfficialCurve) {
         bool any = false;
+        *estimated = false;
         int fi = GetFeatureIndex(devIdx, FEAT_BATTERY_LEVEL_STATUS, 200);
         if (fi > 0) {
             HppReply r;
@@ -283,10 +303,58 @@ public:
         if (fv > 0) {
             HppReply r;
             if (Request(devIdx, (uint8_t)fv, 0x00, nullptr, 0, &r, 200) && r.ok && r.paramLen >= 2) {
-                int mv = r.params[0] | (r.params[1] << 8);
-                if (mv > 1000 && mv < 6000) {
+                // 实测 G913 TKL（046D:C547，1 号通道）func0 回帧：
+                //   11 01 07 0s  0F 6C 00 00 ...
+                //   0F 6C = 3948 mV（大端），第 3 字节 = 充电标志。
+                // 旧实现按小端读成 0x6C0F = 27663 mV，被范围检查丢掉，于是整台
+                // 设备被标成「未提供电量接口」——这正是读不到键盘电量的原因。
+                int mv = DecodeLogitechVoltage(r.params[0], r.params[1]);
+                if (mv > 0) {
                     *voltage = mv;
                     any = true;
+
+                    // 标志位（openlogi / Logi Options+ 的 0x1001 布局）：
+                    //   bit7 外接电源；bit0..2 外接电源时的充电状态
+                    //   0=充电中 1=已充满 2=未充电 3..7=未知；bit5 电量极低。
+                    // 必须先解标志再算电量：full 要用来做充满校准。
+                    // 实测 G913 TKL 插线后回帧 10 25 80 = 4133 mV + flags 0x80。
+                    // 充电状态下的端电压不可信，上层会改用时间模型覆盖这个数。
+                    bool extPower = false, full = false;
+                    if (r.paramLen >= 3) {
+                        uint8_t flags = r.params[2];
+                        extPower = (flags & 0x80) != 0;
+                        full = extPower && (flags & 0x07) == 1;
+                        // 0x1000 已经给了状态时以它为准，这里只补空白。
+                        if (status->empty()) {
+                            if (!extPower) {
+                                *status = L"放电中";
+                                *charging = 0;
+                            } else {
+                                switch (flags & 0x07) {
+                                    case 0:  *status = L"充电中";   *charging = 1;  break;
+                                    case 1:  *status = L"已充满";   *charging = 1;  break;
+                                    case 2:  *status = L"未充电";   *charging = 0;  break;
+                                    default: *status = L"外接电源"; *charging = -1; break;
+                                }
+                            }
+                        }
+                    }
+                    if (*level < 0) {
+                        int pct;
+                        if (full) {
+                            pct = 100;   // 充满校准：G HUB 也把充满对齐到 100%
+                        } else if (useOfficialCurve) {
+                            // 官方充电/放电是两条独立曲线，按状态分别查表。
+                            pct = extPower ? LogitechChargingPercent(mv)
+                                           : LogitechDischargePercent(mv);
+                        } else {
+                            pct = LogitechBatteryPercent(mv, false);
+                        }
+                        if (pct >= 0) {
+                            *level = pct;
+                            *estimated = true;
+                        }
+                    }
                 }
             }
         }
@@ -315,6 +383,17 @@ std::map<std::wstring, std::set<int>> g_liveIdx;
 std::map<std::wstring, std::wstring> g_liveColl;
 int g_scanTick = 0;
 bool g_fullSweep = true;
+
+// 估算电量的平滑状态。key 用归一化后的型号名，不是接口路径：G913 TKL 插上
+// 数据线后会从接收器 C547 重新枚举成有线 C343，接口身份变了但电池还是那颗。
+struct LevelState {
+    int level;              // 上次显示的百分比
+    uint64_t at;            // 上次更新时间
+    bool charging;          // 上次是否处于充电
+    uint64_t trickleStart;  // 进入官方涓流阶段的时刻，0 = 未进入
+    int trickleBase;        // 进入涓流时的显示值
+};
+std::map<std::wstring, LevelState> g_logiLevelState;
 
 void ScanLogitech(const std::vector<HidInfo>& all, std::vector<Reading>* out) {
     // 全量扫描时让名字缓存失效：同一接收器通道解绑旧鼠标、配对新鼠标后，
@@ -413,20 +492,17 @@ void ScanLogitech(const std::vector<HidInfo>& all, std::vector<Reading>* out) {
                 answeredHere++;
                 live.insert(idxI);
 
-                int level = -1, voltage = 0, charging = -1;
-                std::wstring status;
-                bool hasBattery = link.Battery(idx, &level, &voltage, &charging, &status);
-                if (hasBattery && level < 0 && voltage == 0) hasBattery = false;
-
                 // 设备名一次读到就不再重读：每次要发 3 个分片请求，
                 // 设备慢的时候每个都可能吃到 200ms 超时，把扫描拖到几百毫秒。
+                // 名字要放在电量之前读：官方曲线只适用于 G913/G915 TKL，得先知道型号。
                 std::wstring name;
                 bool nameResolved = g_logiCache.nameOk.count(key) > 0;
                 if (nameResolved) {
                     name = g_logiCache.names[key];
                 } else {
                     int fiName = link.GetFeatureIndex(idx, FEAT_DEVICE_NAME, 200);
-                    if (fiName > 0) name = link.DeviceName(idx, (uint8_t)fiName, 200);
+                    if (fiName > 0)
+                        name = ShortDeviceName(link.DeviceName(idx, (uint8_t)fiName, 200));
                     if (!name.empty()) g_logiCache.nameOk.insert(key);
                 }
                 if (name.empty()) {
@@ -443,20 +519,94 @@ void ScanLogitech(const std::vector<HidInfo>& all, std::vector<Reading>* out) {
                 g_logiCache.names[key] = name;
                 g_logiCache.kinds[key] = kind;
 
+                // G913 TKL / G915 TKL 用 G HUB 的官方 PowerModel 曲线，其余罗技设备
+                // 退回内核通用曲线。4133mV 充电时两者差 14 点（83% vs 97%）。
+                bool useOfficial = ContainsNoCase(name, L"g913") ||
+                                   ContainsNoCase(name, L"g915");
+
+                int level = -1, voltage = 0, charging = -1;
+                bool estimated = false;
+                std::wstring status;
+                bool hasBattery = link.Battery(idx, &level, &voltage, &charging,
+                                               &status, &estimated, useOfficial);
+                if (hasBattery && level < 0 && voltage == 0) hasBattery = false;
+
                 Reading r;
-                r.key = key;
+                // 有线/无线切换时 USB 身份会变（C547 接收器 → C343 有线直连）。
+                // 用设备自报的型号名归一化，插线前后才是同一行、同一份历史读数，
+                // 面板不会闪出两行，平滑状态也不会被丢掉。占位名不含型号，退回接口路径。
+                bool realName = !name.empty() &&
+                                name.find(L"罗技设备") == std::wstring::npos;
+                std::wstring identity = realName ? (L"model:" + Lower(name)) : baseKey;
+                r.key = L"logitech:" + identity + L":" + std::to_wstring(idxI);
                 r.name = name;
                 r.kind = kind;
                 r.vendor = L"罗技";
-                r.transport = receiver ? L"2.4G 接收器" : L"蓝牙 / 直连";
+                if (receiver) {
+                    r.transport = L"2.4G 接收器";
+                } else {
+                    std::wstring tp = TransportOf(coll.path, coll.product);
+                    r.transport = (tp == L"USB") ? L"USB 有线" : tp;
+                }
                 r.level = level;
                 r.voltage = voltage;
                 r.charging = charging;
                 r.status = hasBattery ? status : L"未提供电量接口";
+                r.approximate = estimated;
+                r.officialCurve = estimated && useOfficial;
                 r.provider = L"logitech";
                 if (level < 0) r.outcome = hasBattery ? Outcome::NoReply : Outcome::Unsupported;
                 if (!hasBattery) r.detail = L"设备已响应，但未暴露电量特性，通常是设备正在休眠";
-                if (level < 0 && voltage > 0) {
+                // G913 官方 PowerModel：放电查 <discharge>，充电查 <charging>。
+                // 充电曲线只到 4.20V = 91%，之后按官方 equation_coefficiency=150
+                // 推进（电压稳定在 4100mV 以上才启动），配合限速平滑收尾。
+                // 0x1000 自报的精确百分比不参与这套逻辑。
+                if (r.level >= 0) {
+                    uint64_t nowMs = GetTickCount64();
+                    bool nowCharging = (r.charging == 1);
+                    bool fullCharged = (r.status == L"已充满");
+                    auto sit = g_logiLevelState.find(r.key);
+                    if (!estimated || sit == g_logiLevelState.end()) {
+                        g_logiLevelState[r.key] = {r.level, nowMs, nowCharging, 0, r.level};
+                    } else {
+                        LevelState& s = sit->second;
+                        if (!nowCharging) s.trickleStart = 0;   // 拔线：退出涓流
+                        s.charging = nowCharging;
+
+                        int target = r.level;
+                        if (nowCharging) {
+                            if (fullCharged) {
+                                target = 100;   // 设备自报充满，直接对齐
+                            } else if (voltage >= kLogiTrickleStartMv) {
+                                if (s.trickleStart == 0) {
+                                    s.trickleStart = nowMs;
+                                    s.trickleBase = r.level;   // 从官方曲线值起步
+                                }
+                                int trickle = LogitechTrickleLevel(
+                                    s.trickleBase, nowMs - s.trickleStart);
+                                target = std::max(r.level, trickle);
+                            }
+                        }
+                        uint64_t elapsed = nowMs >= s.at ? nowMs - s.at : 0;
+                        r.level = SmoothEstimatedLevel(s.level, target, elapsed);
+                        s.level = r.level;
+                        s.at = nowMs;
+                    }
+                }
+
+                if (estimated) {
+                    // 百分比来自电压换算：G913 用 G HUB 官方 PowerModel（充放电两条曲线），
+                    // 其余罗技设备用内核通用曲线。写清来源，别让人以为是设备自报。
+                    wchar_t buf[160];
+                    swprintf(buf, 160,
+                             L"%ls电压 %d mV（%ls）· %ls；设备只报电压，不提供百分比",
+                             useOfficial ? L"" : L"≈ ",
+                             voltage,
+                             charging == 1 ? L"充电中" : L"放电中",
+                             useOfficial ? L"G HUB 官方充放电曲线"
+                                         : L"罗技通用电压曲线");
+                    r.detail = buf;
+                } else if (level < 0 && voltage > 0) {
                     wchar_t buf[64];
                     swprintf(buf, 64, L"仅电压 %d mV", voltage);
                     r.detail = buf;
@@ -476,25 +626,33 @@ void ScanLogitech(const std::vector<HidInfo>& all, std::vector<Reading>* out) {
                 out->push_back(it->second);
                 continue;
             }
-            // 有静默通道 = 接收器上挂了设备但处于休眠
-            // 只有确认存在过的通道，静默才代表"设备在休眠"。
-            // 从没应答过的通道超时只能说明没有设备——否则每台接收器都会
-            // 凭空多出 5 台"休眠设备"（超时被误读成休眠）。
+            // 有静默通道 = 接收器上挂了设备但处于休眠。
+            // 接收器：只有确认存在过的通道才出占位，否则每台接收器都会凭空
+            // 多出 5 台"幽灵设备"（超时被误读成休眠）。
+            // 有线直连（非接收器）只有一个通道，超时就是设备在休眠，必须出占位，
+            // 否则插着线时键盘睡一下，面板里就整行消失。
             std::wstring probeKey = L"logitech:" + baseKey + L":" + std::to_wstring(idxI);
             bool known = live.count(idxI) > 0 ||
                          g_logiCache.names.find(probeKey) != g_logiCache.names.end();
-            if (receiver && silent[idxI] && known) {
-                std::wstring key = probeKey;
+            if (silent[idxI] && (known || !receiver)) {
                 Reading r;
-                r.key = key;
-                auto ni = g_logiCache.names.find(key);
+                auto ni = g_logiCache.names.find(probeKey);
                 r.name = (ni != g_logiCache.names.end())
                              ? ni->second
-                             : (L"罗技无线设备（" + std::to_wstring(idxI) + L" 号通道）");
-                auto ki = g_logiCache.kinds.find(key);
-                r.kind = (ki != g_logiCache.kinds.end()) ? ki->second : Kind::Other;
+                             : (receiver ? (L"罗技无线设备（" + std::to_wstring(idxI) + L" 号通道）")
+                                         : (colls.front().product.empty()
+                                                ? L"罗技设备" : colls.front().product));
+                // 用和正常读数相同的归一化 key，休眠占位才能接上历史电量，
+                // 唤醒后也不会在面板里闪成两行。
+                bool realName = !r.name.empty() &&
+                                r.name.find(L"罗技设备") == std::wstring::npos;
+                r.key = L"logitech:" +
+                        (realName ? (L"model:" + Lower(r.name)) : baseKey) + L":" +
+                        std::to_wstring(idxI);
+                auto ki = g_logiCache.kinds.find(probeKey);
+                r.kind = (ki != g_logiCache.kinds.end()) ? ki->second : ClassifyName(r.name);
                 r.vendor = L"罗技";
-                r.transport = L"2.4G 接收器";
+                r.transport = receiver ? L"2.4G 接收器" : L"USB 有线";
                 r.status = L"设备休眠";
                 r.detail = L"移动鼠标或按键唤醒后可读取电量";
                 r.provider = L"logitech";
@@ -2137,6 +2295,134 @@ bool DecodeBatteryReport(const std::vector<uint8_t>& buf, const BatteryField& bf
 
 namespace {
 
+bool PlausibleLogitechMv(int mv) {
+    // 单节锂电的合理区间。内核对 >= 5000 mV 会警告"可能用错曲线"，
+    // 2S 电池组不该走这条单节曲线，直接拒绝更安全。
+    return mv >= 3000 && mv <= 5000;
+}
+
+}  // namespace
+
+int DecodeLogitechVoltage(uint8_t b0, uint8_t b1) {
+    int be = ((int)b0 << 8) | b1;
+    if (PlausibleLogitechMv(be)) return be;
+    int le = ((int)b1 << 8) | b0;
+    if (PlausibleLogitechMv(le)) return le;
+    return -1;
+}
+
+// Linux 内核 drivers/hid/hid-logitech-hidpp.c 的
+// hidpp20_map_battery_capacity()：100 个递减电压阈值，
+// 找到第一个 mv >= 阈值[i]，百分比 = 100 - i；一个都不满足即 0%。
+// 内核自己也注明"这条曲线未必完美适配所有实现 BATTERY_VOLTAGE 的设备"，
+// 所以结果只能当估算，界面标「≈」。
+int LogitechVoltageToPercent(int millivolts) {
+    static const int kCurve[100] = {
+        4186, 4156, 4143, 4133, 4122, 4113, 4103, 4094, 4086, 4075,
+        4067, 4059, 4051, 4043, 4035, 4027, 4019, 4011, 4003, 3997,
+        3989, 3983, 3976, 3969, 3961, 3955, 3949, 3942, 3935, 3929,
+        3922, 3916, 3909, 3902, 3896, 3890, 3883, 3877, 3870, 3865,
+        3859, 3853, 3848, 3842, 3837, 3833, 3828, 3824, 3819, 3815,
+        3811, 3808, 3804, 3800, 3797, 3793, 3790, 3787, 3784, 3781,
+        3778, 3775, 3772, 3770, 3767, 3764, 3762, 3759, 3757, 3754,
+        3751, 3748, 3744, 3741, 3737, 3734, 3730, 3726, 3724, 3720,
+        3717, 3714, 3710, 3706, 3702, 3697, 3693, 3688, 3683, 3677,
+        3671, 3666, 3662, 3658, 3654, 3646, 3633, 3612, 3579, 3537,
+    };
+    if (!PlausibleLogitechMv(millivolts)) return -1;
+    for (int i = 0; i < 100; ++i) {
+        if (millivolts >= kCurve[i]) return 100 - i;
+    }
+    return 0;
+}
+
+int LogitechBatteryPercent(int millivolts, bool full) {
+    // 设备自报「已充满」时直接对齐 100%：这是 G HUB 的充满校准思路，
+    // 每次充满都把读数重新对齐到该电池的最大电压。
+    if (full) return 100;
+    if (!PlausibleLogitechMv(millivolts)) return -1;
+    // 充放电共用一条曲线。充电端电压偏高的问题交给上层的时间模型处理，
+    // 绝不在这里按状态扣偏移——那会在拔线瞬间制造 19 点断层。
+    return LogitechVoltageToPercent(millivolts);
+}
+
+namespace {
+
+// 单调表线性插值。表里的 pct10 是 0.1% 单位，返回同样单位。
+int LookupCurveDesc(const LogiCurvePoint* t, int n, int mv) {
+    if (mv >= t[0].mv) return t[0].pct10;
+    if (mv <= t[n - 1].mv) return t[n - 1].pct10;
+    for (int i = 1; i < n; ++i) {
+        if (mv >= t[i].mv) {
+            int x0 = t[i - 1].mv, y0 = t[i - 1].pct10;
+            int x1 = t[i].mv, y1 = t[i].pct10;
+            if (x0 == x1) return y1;
+            double f = (double)(y1 - y0) * (mv - x0) / (double)(x1 - x0);
+            return y0 + (int)(f >= 0 ? f + 0.5 : f - 0.5);
+        }
+    }
+    return t[n - 1].pct10;
+}
+
+int LookupCurveAsc(const LogiCurvePoint* t, int n, int mv) {
+    if (mv <= t[0].mv) return t[0].pct10;
+    if (mv >= t[n - 1].mv) return t[n - 1].pct10;
+    for (int i = 1; i < n; ++i) {
+        if (mv <= t[i].mv) {
+            int x0 = t[i - 1].mv, y0 = t[i - 1].pct10;
+            int x1 = t[i].mv, y1 = t[i].pct10;
+            if (x0 == x1) return y1;
+            double f = (double)(y1 - y0) * (mv - x0) / (double)(x1 - x0);
+            return y0 + (int)(f >= 0 ? f + 0.5 : f - 0.5);
+        }
+    }
+    return t[n - 1].pct10;
+}
+
+int Pct10ToPct(int p10) {
+    if (p10 < 0) return -1;
+    return (p10 + 5) / 10;
+}
+
+}  // namespace
+
+int LogitechDischargePercent(int millivolts) {
+    if (!PlausibleLogitechMv(millivolts)) return -1;
+    const int n = (int)(sizeof(kLogiDischargeCurve) / sizeof(kLogiDischargeCurve[0]));
+    return Pct10ToPct(LookupCurveDesc(kLogiDischargeCurve, n, millivolts));
+}
+
+int LogitechChargingPercent(int millivolts) {
+    if (!PlausibleLogitechMv(millivolts)) return -1;
+    const int n = (int)(sizeof(kLogiChargingCurve) / sizeof(kLogiChargingCurve[0]));
+    return Pct10ToPct(LookupCurveAsc(kLogiChargingCurve, n, millivolts));
+}
+
+int LogitechTrickleLevel(int base, uint64_t stableElapsedMs) {
+    if (base < 0) return -1;
+    if (base >= 100) return 100;
+    // 官方 equation_coefficiency="150"：每 150 秒涨 1%。
+    uint64_t gained = stableElapsedMs / 150000ULL;
+    if (gained > 100ULL) gained = 100ULL;
+    int v = base + (int)gained;
+    return v > 100 ? 100 : v;
+}
+
+int SmoothEstimatedLevel(int prev, int next, uint64_t elapsedMs) {
+    if (prev < 0 || next < 0) return next;
+    if (next > 100) next = 100;
+    // 关机几小时再开机，电量本来就该直接跳到真实值，不能慢慢爬两小时。
+    if (elapsedMs > 30ULL * 60 * 1000) return next;
+    // 2 分钟一轮、2~3 小时充满，正常每轮涨 1~3 点。6 点足够宽松，
+    // 只用来挡住"插线 / 拔线瞬间端电压跳变"造成的 20 点假变化。
+    const int kMaxStep = 6;
+    if (next > prev + kMaxStep) return prev + kMaxStep;
+    if (next < prev - kMaxStep) return prev - kMaxStep;
+    return next;
+}
+
+namespace {
+
 // ---------------------------------------------------------------- 雷柏
 
 // 雷柏办公系列（M200 / M200G / M200G Plus 这一代）在 2.4G 接收器下
@@ -2380,11 +2666,14 @@ std::wstring LogitechDiagnostics() {
                 int fi = link.GetFeatureIndex((uint8_t)i, FEAT_BATTERY_LEVEL_STATUS, 500);
                 int fv = link.GetFeatureIndex((uint8_t)i, FEAT_BATTERY_VOLTAGE, 500);
                 int level = -1, volt = 0, ch = -1;
+                bool estimated = false;
                 std::wstring st;
-                bool any = link.Battery((uint8_t)i, &level, &volt, &ch, &st);
+                bool any = link.Battery((uint8_t)i, &level, &volt, &ch, &st, &estimated,
+                                        false);
                 swprintf(buf, 192,
-                         L"      特性0x1000=%d 0x1001=%d | 电量=%d 电压=%d 充电=%d any=%d\n",
-                         fi, fv, level, volt, ch, (int)any);
+                         L"      特性0x1000=%d 0x1001=%d | 电量=%d 电压=%d 充电=%d "
+                         L"电压估算=%d any=%d\n",
+                         fi, fv, level, volt, ch, (int)estimated, (int)any);
             }
             out += buf;
         }
@@ -2439,21 +2728,7 @@ void MonitorScan(std::vector<Reading>* out) {
         p.scan(ctx, &got);
         ULONGLONG ms = GetTickCount64() - start;
 
-        for (auto& r : got) {
-            r.updated = now;
-            if (r.level >= 0) {
-                ++readable;
-            } else {
-                switch (r.outcome) {
-                    case Outcome::NoReply: ++noReply; break;
-                    case Outcome::Busy: ++busy; break;
-                    case Outcome::BadFrame: ++badFrame; break;
-                    case Outcome::Unsupported: ++unsupported; break;
-                    default: ++noReply; break;   // 没标注的按"没应答"算，不会漏计
-                }
-            }
-        }
-        total += (int)got.size();
+        for (auto& r : got) r.updated = now;
         out->insert(out->end(), got.begin(), got.end());
 
         wchar_t seg[80];
@@ -2464,6 +2739,25 @@ void MonitorScan(std::vector<Reading>* out) {
         // 退出时尽快收手：每个厂商链路都可能等设备超时，逐段检查能让退出从
         // "等一整个扫描周期"缩到"最多等当前这一段"。
         if (ScanCancelRequested()) break;
+    }
+
+    // 双模外设插数据线后会同时枚举出有线 + 无线两个 USB 设备，先合并再去统计，
+    // 否则汇总里的「台数」会比面板上真实的行数多。
+    MergeWiredWirelessDuplicates(out);
+    total = (int)out->size();
+    readable = noReply = busy = badFrame = unsupported = 0;
+    for (const auto& r : *out) {
+        if (r.level >= 0) {
+            ++readable;
+        } else {
+            switch (r.outcome) {
+                case Outcome::NoReply: ++noReply; break;
+                case Outcome::Busy: ++busy; break;
+                case Outcome::BadFrame: ++badFrame; break;
+                case Outcome::Unsupported: ++unsupported; break;
+                default: ++noReply; break;
+            }
+        }
     }
 
     // 一行汇总给用户看，一行分项给排查用。
@@ -2552,6 +2846,70 @@ std::wstring BleDiagnostics() {
 
 // ---------------------------------------------------------------- 状态合并
 
+namespace {
+
+bool IsWiredTransport(const std::wstring& t) {
+    return t.find(L"有线") != std::wstring::npos || t == L"USB";
+}
+
+bool IsWirelessTransport(const std::wstring& t) {
+    return t.find(L"2.4G") != std::wstring::npos ||
+           t.find(L"接收器") != std::wstring::npos ||
+           t.find(L"蓝牙") != std::wstring::npos;
+}
+
+// 只合并"明显是同一台双模外设"的两行。两条都是无线的同型号设备不合并：
+// 它们各有各的 ContainerId，本来就是两只鼠标。
+bool IsWiredWirelessDuplicate(const Reading& a, const Reading& b) {
+    if (a.name.empty() || a.name != b.name) return false;
+    if (a.provider != b.provider) return false;
+    if (a.kind != b.kind) return false;
+    if (a.kind != Kind::Mouse && a.kind != Kind::Keyboard) return false;
+    bool aw = IsWiredTransport(a.transport), bw = IsWiredTransport(b.transport);
+    if (aw == bw) return false;
+    return (aw || IsWirelessTransport(a.transport)) &&
+           (bw || IsWirelessTransport(b.transport));
+}
+
+// 保留哪条：充电中 > 有读数 > 本轮采样 > 在线 > 有线。
+// 用户插线时通常想看到「充电中」那一行，而不是 2.4G 那边的旧读数。
+int DuplicateScore(const Reading& r) {
+    int s = 0;
+    if (r.charging == 1) s += 1000;
+    if (r.level >= 0) s += 500;
+    if (!r.stale) s += 100;
+    if (r.online) s += 50;
+    if (IsWiredTransport(r.transport)) s += 10;
+    return s;
+}
+
+}  // namespace
+
+void MergeWiredWirelessDuplicates(std::vector<Reading>* list) {
+    if (!list || list->size() < 2) return;
+    std::vector<Reading> out;
+    std::vector<bool> used(list->size(), false);
+    for (size_t i = 0; i < list->size(); ++i) {
+        if (used[i]) continue;
+        size_t best = i;
+        int merged = 0;
+        for (size_t j = i + 1; j < list->size(); ++j) {
+            if (used[j]) continue;
+            if (!IsWiredWirelessDuplicate((*list)[i], (*list)[j])) continue;
+            used[j] = true;
+            ++merged;
+            if (DuplicateScore((*list)[j]) > DuplicateScore((*list)[best])) best = j;
+        }
+        used[i] = true;
+        Reading r = (*list)[best];
+        if (merged > 0) {
+            r.detail = L"已合并「USB 有线 + 无线」两个接口，同一台设备只显示一行";
+        }
+        out.push_back(r);
+    }
+    *list = std::move(out);
+}
+
 void MergeReading(Reading* incoming, const Reading* old, ULONGLONG now) {
     if (!incoming) return;
     Reading& r = *incoming;
@@ -2567,6 +2925,8 @@ void MergeReading(Reading* incoming, const Reading* old, ULONGLONG now) {
             r.level = old->level;
             r.voltage = old->voltage;
             r.charging = old->charging;
+            r.approximate = old->approximate;   // 沿用旧值时别把「≈」弄丢
+            r.officialCurve = old->officialCurve;
             r.sampledAt = old->sampledAt;
             r.stale = true;
         } else {

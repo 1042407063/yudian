@@ -73,6 +73,12 @@ struct Reading {
     // true = 当前显示的是缓存值（设备休眠、或 BLE 这一轮没刷新），不是本轮采样。
     // UI 据此把年龄显示出来，避免把旧值当新值。
     bool stale = false;
+    // true = 百分比是按电压曲线估算的，不是设备自报（罗技 0x1001 只给电压）。
+    bool approximate = false;
+    // true = 估算用的是该型号的官方曲线（G913/G915 从 G HUB PowerModel 提取），
+    // 不是内核通用表。UI 标「G HUB 官方曲线」、不加「≈」——数值和官方软件同源；
+    // 其余只有电压的设备仍标「电压估算」。
+    bool officialCurve = false;
 
     bool IsCritical() const { return level >= 0 && level <= 10; }
     bool IsLow() const { return level > 10 && level <= 20; }
@@ -145,6 +151,11 @@ void MonitorScan(std::vector<Reading>* out);
 // 把一条新扫到的记录并入已有状态：休眠占位保留最后一次有效读数并标 stale。
 // 单独暴露是为了能脱离硬件做纯函数测试（见 review 验证脚本）。
 void MergeReading(Reading* incoming, const Reading* old, ULONGLONG now);
+// 双模外设（如迈从 A5 V3 Pro）插数据线后会同时枚举出「USB 有线」和
+// 「2.4G 接收器」两个 USB 设备、两个 ContainerId，面板出现两行一样的鼠标。
+// 按「同名 + 同品类 + 一条有线一条无线」合并，保留充电中/有读数那条。
+// 两条都是无线的同型号设备不合并——那是两只不同的鼠标。
+void MergeWiredWirelessDuplicates(std::vector<Reading>* list);
 int CurrentInterval();          // 当前刷新间隔（秒），全局唯一数据源
 std::wstring LogitechDiagnostics();
 std::wstring VendorDiagnostics();   // VGN / VXE / ATK 这类 Compx 接收器的原始帧

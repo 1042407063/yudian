@@ -20,6 +20,8 @@
 `hidprobe.py` | 公共库：枚举 HID 接口、打开句柄、异步读（带超时）、异步写、读报告描述符。也当 CLI 用：`enum` / `listen <vid:pid> <秒> [usage]` / `desc <vid:pid> [usage]` / `send ...`
 `probe3.py` | 最常用：对一个接口「写一帧 → 收全部回包」，参数 `<vid:pid> <usage> <长度> <hex...>`，`F:` 前缀表示走特性报告
 `ask.py` | 命令字扫描：固定首字节，遍历第二字节，打印有回包的组合
+`logitech_g913.py` | 罗技 LIGHTSPEED 接收器（`046D:C547` / G913 TKL）的 HID++ 通道与电量特性实测：枚举两个 `FF00` 集合、扫 1–6/0xFF 通道、查 `0x1000`/`0x1001`/`0x0005` 并打印原始帧。只读
+`extract_ghub_powermodel.py` | 从 G HUB 安装资源 `depots\<build>\g915_tkl_us\battery.xml` 提取官方充放电曲线，生成 `app/src/logitech_powermodel.h`。只读 G HUB 资源、只写项目内的头文件
 
 ## 迈从 MCHOSE
 
@@ -72,7 +74,7 @@
 
 | 档位 | 行为 | 脚本 |
 |---|---|---|
-| **只读** | 只 GetFeature / ReadFile，或只发协议规定的读命令 | `hidprobe.py enum/listen/desc`、`caps.py`、`sony_dump.py`、`sony_watch.py`、`sony_diff.py`、`sony_usb.py`、`sony_usb2.py`、`ask.py`、`feat.py`、`cmdread.py`、`probe3.py`、`probe_final.py`、`poll_bat.py`、`loop_feat.py`、`openprobe.py` |
+| **只读** | 只 GetFeature / ReadFile，或只发协议规定的读命令 | `hidprobe.py enum/listen/desc`、`caps.py`、`sony_dump.py`、`sony_watch.py`、`sony_diff.py`、`sony_usb.py`、`sony_usb2.py`、`ask.py`、`feat.py`、`cmdread.py`、`probe3.py`、`probe_final.py`、`poll_bat.py`、`loop_feat.py`、`openprobe.py`、`logitech_g913.py`、`extract_ghub_powermodel.py` |
 | **会写设备** | 向设备发写命令；可能改配置、切模式或让设备短暂无响应 | `scan13.py`、`scanrid.py`、`scanrid2.py`、`lenscan.py`、`cmdscan.py`、`sweep.py`、`matrix2.py`、`variants.py`、`variants_v2.py`、`cs_try.py`、`v2_out.py`、`v2_feat.py`、`loop_v2.py`、`loop_v2b.py`、`probe_matrix.py`、`crossif.py`、`classic.py`、`flydigi*.py`、`sony_enable.py`、`sony_mode.py`、`sony_mode2.py`、`sony_outlen.py`、`namescan.py`、`regscan*.py` |
 | **会杀进程** | 结束正在运行的程序 | `shot_panel.py`、`frost_check.py`（先发 WM_CLOSE，超时才 taskkill） |
 
@@ -85,6 +87,10 @@
 - 迈从 V1：`13 4A 01 00` 取电量，应答末字节是**前 19 字节求和**（不是 `0x55 - sum`）。
 - 飞智：`5A A5 01 02 00`，33 字节报文，首字节是 report id `0`；隔一次才应答，要重试。
 - 索尼：USB 报文电量在**第 53 字节**，蓝牙完整报文在第 54 字节；蓝牙简化报文没有电量。
+- 罗技 G913 TKL（`046D:C547`）：只有 20 字节 `FF00/0002` 集合的 **1 号通道**应答 HID++ 4.2；`0x1000` 不存在，电量只有 `0x1001`，`func0` 回 `0F 6C 00`（**大端** 3948 mV + 充电标志）；设备名走 `0x0005` 的字节偏移分片。
+- G913 的准确电量来自 **G HUB 的 PowerModel**：`C:\ProgramData\LGHUB\depots\<build>\g915_tkl_us\battery.xml`，`<discharge>` 和 `<charging>` 是两条独立曲线（4133 mV 充电 83%、放电 99%），`equation_coefficiency="150"` 是涓流速度。用 `extract_ghub_powermodel.py` 生成 `app/src/logitech_powermodel.h`。
+- G913 TKL 插数据线后会重新枚举成 **`046D:C343` 有线直连**（接收器 C547 的通道随即报 `0x08`）。充电回帧 `10 25 80` = 4133 mV + flags `0x80`（外接电源 + 充电中），充电末期稳定在 4179 mV。
+- **`C343` 完整特性表（36 个，用 `0x0001 FEATURE SET` 枚举）**：`0000 0001 0003 0005 1D4B 0020 1001 1814 1815 8071 8081 1B04 1BC0 4100 4522 4540 8010 8020 8030 8040 8100 8060 00C2 00D0 1802 1803 1806 1813 1805 1830 1890 1891 18A1 1E00 1EB0 1861`。**没有 `0x1000` / `0x1004` / `0x1F20`**，即硬件不提供自报百分比；`0x1001` fn0 只回 2 字节 mV + 1 字节 flags，fn1 全零，fn2/fn3 报错。隐藏特性 `0x1802/0x1806` 回 error `0x05`（需 `0x1E00` 写设备解锁，本项目只读不做）。`battery_scan.py` 扫遍 34 个接口也没有标准 HID 电量字段。
 - 通用：**写和读不要共用一个异步句柄**，否则输入管道静默，表现像「设备休眠」。
   这条在 2026-10-29 的修复里已经落实到所有脚本：写用同步句柄、读用独立异步句柄。
   此前用单句柄扫出来的"无回包"结论（`scan13` / `scanrid*` / `matrix2` 等）需要用
