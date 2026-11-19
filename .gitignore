@@ -54,3 +54,6 @@ _scratch/
 .ai-tmp/
 *.bak
 *~
+
+# JiuwenSwarm runtime file operation logs
+.agent_history/

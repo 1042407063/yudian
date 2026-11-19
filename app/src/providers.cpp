@@ -96,19 +96,29 @@ std::wstring TransportOf(const std::wstring& path, const std::wstring& product) 
     return L"USB";
 }
 
+}  // namespace
+
+// 名称分类是纯函数，导出给 --selftest 验证，不读取或修改硬件。
 Kind ClassifyName(const std::wstring& name) {
-    std::wstring n = Lower(name);
-    const wchar_t* mice[] = {L"mouse", L"mice", L"mx master", L"mx anywhere",
+    std::wstring n = name;
+    std::transform(n.begin(), n.end(), n.begin(), ::towlower);
+    const wchar_t* mice[] = {L"mouse", L"mx master", L"mx anywhere",
                              L"superlight", L"g304", L"g102", L"g502", L"g703",
                              L"g903", L"g pro wireless", L"lift", L"鼠标"};
     const wchar_t* kb[] = {L"keyboard", L"mx keys", L"g913", L"g915", L"g610",
                            L"g512", L"k380", L"k855", L"pop keys", L"craft", L"键盘"};
-    const wchar_t* hs[] = {L"headset", L"g733", L"g435", L"zone", L"耳机"};
+    const wchar_t* pads[] = {L"controller", L"gamepad", L"joystick", L"dualshock",
+                             L"dualsense", L"xbox", L"手柄"};
+    const wchar_t* hs[] = {L"headset", L"headphones", L"earbuds", L"earphone",
+                           L"g733", L"g435", L"zone", L"wh-", L"wf-", L"wi-", L"耳机"};
+    for (auto w : pads) if (n.find(w) != std::wstring::npos) return Kind::Controller;
+    for (auto w : hs) if (n.find(w) != std::wstring::npos) return Kind::Headset;
     for (auto w : mice) if (n.find(w) != std::wstring::npos) return Kind::Mouse;
     for (auto w : kb) if (n.find(w) != std::wstring::npos) return Kind::Keyboard;
-    for (auto w : hs) if (n.find(w) != std::wstring::npos) return Kind::Headset;
     return Kind::Other;
 }
+
+namespace {
 
 // 0x0005 报的是完整市场名。G913 TKL 会回 58 字符的
 // "G913 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard"，面板里只剩省略号。

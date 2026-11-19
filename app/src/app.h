@@ -43,6 +43,8 @@ enum class Kind {
 };
 
 const wchar_t* KindLabel(Kind k);
+// 仅根据明确的设备名称关键词分类；未知设备保持 Other，不猜测成鼠标。
+Kind ClassifyName(const std::wstring& name);
 
 // 读不到电量时"为什么读不到"。界面文案仍由 status / detail 决定，
 // 这个代号只用来统计和断言：它能被计数、能被比较，中文句子不能。
@@ -99,6 +101,10 @@ struct Config {
     bool notifyLow = true;
     bool autostart = false;
     std::wstring theme = L"auto";   // auto / light / dark
+    // 托盘关注设备：空 = 自动显示在线设备中的最低电量；非空保存 Reading.key。
+    std::wstring trayDevice;
+    bool trayBattery = true;        // 独立的百分比 / 电池图标，默认开启
+    bool overlay = true;            // 显示可拖动的设备电量浮窗
     // 面板被拖动后的卡片左上角（物理像素）；-1 = 还没拖过，贴右下角
     int panelX = -1;
     int panelY = -1;
@@ -145,6 +151,7 @@ void UiResetPanelPos();       // 面板回到默认右下角（右键菜单用�
 // 主题
 bool IsDarkTheme();
 void UiRebuildTheme();
+void UiSetOverlayVisible(bool visible);
 
 // 扫描
 void MonitorScan(std::vector<Reading>* out);
@@ -179,13 +186,23 @@ bool ScanCancelRequested();
 #define WM_APP_TRAY      (WM_APP + 2)
 #define WM_APP_TRAYMSG   (WM_APP + 3)
 
-#define TRAY_UID 0x51
+#define TRAY_UID 0x51             // 兼容并清理 1.x 版本的主图标
+#define TRAY_BATTERY_UID 0x52     // 兼容并清理 1.x 版本的独立电量图标
+#define TRAY_DEVICE_UID_BASE 0x100
+
+// 通知区图标身份必须稳定：刷新只修改原图标，不能用自增序号不断 NIM_ADD。
+UINT TrayUidFor(const std::wstring& key);
+UINT LegacyTrayUidFor(const std::wstring& key);
+UINT TrayUidForIndex(size_t index);
 
 enum MenuId {
     IDM_SHOW = 100,
     IDM_REFRESH,
     IDM_AUTOSTART,
+    IDM_OVERLAY,
     IDM_QUIT,
     IDM_RESET_POS,
+    IDM_TRAY_SETTINGS,
     IDM_INTERVAL_BASE = 200,   // + 索引
+    IDM_TRAY_DEVICE_BASE = 300, // + 设备序号（仅限当前快照）
 };

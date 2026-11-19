@@ -161,6 +161,47 @@ void RunCases() {
           SmoothEstimatedLevel(73, 97, 31ULL * 60 * 1000) == 97);
     Check(L"Smooth with no history uses new value", SmoothEstimatedLevel(-1, 55, 0) == 55);
 
+    // ---------------------------------------------- 托盘：自动最低电量 / 固定设备
+    {
+        auto Device = [](const wchar_t* key, int level, bool online) {
+            Reading r;
+            r.key = key;
+            r.name = key;
+            r.level = level;
+            r.online = online;
+            return r;
+        };
+        std::vector<Reading> devices = {
+            Device(L"mouse", 72, true), Device(L"pad", 18, true),
+            Device(L"offline", 2, false), Device(L"unknown", -1, true),
+        };
+        Check(L"Tray UID is stable for the same device key",
+              TrayUidFor(L"mouse") == TrayUidFor(L"mouse"));
+        Check(L"Tray UID differs for separate devices",
+              TrayUidFor(L"mouse") != TrayUidFor(L"pad"));
+        Check(L"Tray UID does not collide with legacy icons",
+              TrayUidFor(L"mouse") > TRAY_BATTERY_UID);
+        Check(L"Tray layout revision avoids the Explorer bitmap cache identity",
+              TrayUidFor(L"mouse") == LegacyTrayUidFor(L"mouse") + 0x8000u);
+        g_snapshot = devices;
+        Check(L"Tray index lookup follows device key, not a global serial",
+              TrayUidForIndex(0) == TrayUidFor(L"mouse") &&
+              TrayUidForIndex(1) == TrayUidFor(L"pad"));
+        Check(L"Tray index lookup rejects a missing device", TrayUidForIndex(9) == 0);
+        g_snapshot.clear();
+    }
+
+    // ---------------------------------------------- 设备图标分类
+    Check(L"Classify Sony over-ear headphones as Headset", ClassifyName(L"WH-1000XM5") == Kind::Headset);
+    Check(L"Classify Bluetooth earbuds as Headset", ClassifyName(L"Galaxy Buds3 Pro earbuds") == Kind::Headset);
+    Check(L"Classify generic headphones as Headset", ClassifyName(L"Bluetooth Headphones") == Kind::Headset);
+    Check(L"Classify Xbox controller as Controller", ClassifyName(L"Xbox Wireless Controller") == Kind::Controller);
+    Check(L"Classify DualShock as Controller", ClassifyName(L"DualShock 4") == Kind::Controller);
+    Check(L"Classify generic gamepad as Controller", ClassifyName(L"USB Gamepad") == Kind::Controller);
+    Check(L"Classify mouse as Mouse", ClassifyName(L"Wireless Mouse") == Kind::Mouse);
+    Check(L"Classify keyboard as Keyboard", ClassifyName(L"Bluetooth Keyboard") == Kind::Keyboard);
+    Check(L"Unknown device remains Other", ClassifyName(L"USB Input Device") == Kind::Other);
+
     // ---------------------------------------------- 双模外设：有线 + 无线去重
     auto Dup = [](const wchar_t* transport, int level, int charging) {
         Reading r;

@@ -294,6 +294,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             break;
+        case WM_DISPLAYCHANGE:
+        case WM_DPICHANGED:
+            // 任务栏方向/屏幕布局/DPI 变化时立即重排；不必等下一次设备扫描。
+            UiRebuildTheme();
+            return 0;
         case WM_SETTINGCHANGE:
             // 系统切换深浅色时广播这条，lParam 是区段名。托盘程序可能常驻数天，
             // 不响应的话会一直是启动那一刻的配色。
@@ -351,6 +356,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     UiSetAutostart(AutostartGet());
                     UiShowToast(L"开机自启设置失败", -1);
                 }
+            } else if (id == IDM_OVERLAY) {
+                g_config.overlay = !g_config.overlay;
+                g_config.Save();
+                UiSetOverlayVisible(g_config.overlay);
+            } else if (id == IDM_TRAY_SETTINGS) {
+                ShellExecuteW(nullptr, L"open", L"ms-settings:taskbar", nullptr, nullptr, SW_SHOWNORMAL);
             } else if (id >= IDM_INTERVAL_BASE && id < IDM_INTERVAL_BASE + kIntervalCount) {
                 int sec = kIntervals[id - IDM_INTERVAL_BASE];
                 g_config.interval = sec;
@@ -411,6 +422,12 @@ void Config::Load() {
             autostart = (val == "1");
         } else if (key == "theme") {
             theme = Utf8ToWide(val);
+        } else if (key == "tray_device") {
+            trayDevice = Utf8ToWide(val);
+        } else if (key == "tray_battery") {
+            trayBattery = (val == "1");
+        } else if (key == "overlay") {
+            overlay = (val == "1");
         } else if (key.rfind("name.", 0) == 0) {
             aliases[Utf8ToWide(key.substr(5))] = Utf8ToWide(val);
         } else if (key == "panel_x") {
@@ -440,6 +457,9 @@ void Config::Save() {
     fprintf(f, "notify_low=%d\n", notifyLow ? 1 : 0);
     fprintf(f, "autostart=%d\n", autostart ? 1 : 0);
     fprintf(f, "theme=%s\n", WideToUtf8(theme).c_str());
+    fprintf(f, "tray_device=%s\n", WideToUtf8(trayDevice).c_str());
+    fprintf(f, "tray_battery=%d\n", trayBattery ? 1 : 0);
+    fprintf(f, "overlay=%d\n", overlay ? 1 : 0);
     fprintf(f, "panel_x=%d\n", panelX);
     fprintf(f, "panel_y=%d\n", panelY);
     for (const auto& kv : aliases) {
@@ -513,6 +533,26 @@ bool AutostartSet(bool enable) {
 }
 
 int CurrentInterval() { return (int)g_intervalSec; }
+
+UINT LegacyTrayUidFor(const std::wstring& key) {
+    // FNV-1a。稳定于设备 key，而不是当前扫描序号或进程启动次数。
+    uint32_t hash = 2166136261u;
+    for (wchar_t c : key) {
+        hash ^= (uint16_t)c;
+        hash *= 16777619u;
+    }
+    return TRAY_DEVICE_UID_BASE + (hash % 0x7EFFu);
+}
+
+UINT TrayUidFor(const std::wstring& key) {
+    // 版式域 2：Explorer 会按 exe + uid 缓存旧位图。大改版式时换新身份，
+    // 同时由 UiCreate 清理域 1 的旧注册；之后同一设备仍始终使用同一 uid。
+    return LegacyTrayUidFor(key) + 0x8000u;
+}
+
+UINT TrayUidForIndex(size_t index) {
+    return index < (size_t)g_snapshot.size() ? TrayUidFor(g_snapshot[index].key) : 0;
+}
 
 const wchar_t* KindLabel(Kind k) {
     switch (k) {
@@ -709,6 +749,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND existing = FindWindowW(MAIN_CLASS, nullptr);
         if (existing) PostMessageW(existing, WM_APP + 5, 0, 0);
+        if (mutex) CloseHandle(mutex);
+        GdiplusShutdown(gdiToken);
         return 0;
     }
 
@@ -733,7 +775,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_scanThread = CreateThread(nullptr, 0, ScanThreadProc, nullptr, 0, nullptr);
-
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);

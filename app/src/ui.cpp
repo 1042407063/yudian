@@ -47,39 +47,17 @@ struct Colors {
 };
 
 const Colors kLight = {
-    0xF7F8FA,  // bg        卡片顶部：偏冷的浅灰，比纯白更像「材质」而不是一张白纸
-    0xE6E6EB,  // border    发丝线，比旧版略冷
-    0x141416,  // text      比 #1D1D1F 再深一点，白底上更实
-    0x6F6F76,  // sub
-    0xEDEDF1,  // track
-    0xF6F6F9,  // tile
-    0xF1F1F6,  // hover
-    0x007AFF,  // accent
-    0x2FB14E,  // ok
-    0xE8900F,  // mid
-    0xDB7B05,  // low
-    0xE5484D,  // critical
-    0xF1F2F6,  // bg2       卡片底部，约 2% 的渐变只负责"有厚度"，不该被看见
-    0xE9E9EF,  // press
-    0x000000,  // shadow
+    0xF4F6F9, 0xDFE5ED, 0x182230, 0x697586,
+    0xE3E9F0, 0xFFFFFF, 0xEAF1FA, 0x2F6FD0,
+    0x20865A, 0xDA8A16, 0xC56A08, 0xD94148,
+    0xF0F3F7, 0xDFE8F4, 0x000000,
 };
 
 const Colors kDark = {
-    0x1E1E22,
-    0x3A3A40,
-    0xF2F2F7,
-    0x9C9CA4,
-    0x3A3A40,
-    0x2A2A2F,
-    0x2C2C32,
-    0x0A84FF,
-    0x32D74B,
-    0xFF9F0A,
-    0xFF9F0A,
-    0xFF453A,
-    0x18181B,  // bg2
-    0x34343A,  // press
-    0x000000,  // shadow
+    0x171E28, 0x303C4C, 0xF0F4FA, 0x9DAABC,
+    0x354252, 0x222D3B, 0x2B394A, 0x72ABFF,
+    0x56D492, 0xFFBA65, 0xFFB45B, 0xFF7770,
+    0x141B24, 0x344456, 0x000000,
 };
 
 const wchar_t* PANEL_CLASS = L"PeripheralBatteryPanel";
@@ -87,7 +65,14 @@ const wchar_t* PANEL_CLASS = L"PeripheralBatteryPanel";
 Colors g_colors = kLight;
 bool g_dark = false;   // 与 g_colors 同步；只由 SetThemePalette / RefreshTheme 写入
 HWND g_panel = nullptr;
-HICON g_trayIcon = nullptr;
+struct DeviceTrayIcon {
+    UINT uid = 0;
+    HICON icon = nullptr;
+    bool added = false;
+};
+std::map<std::wstring, DeviceTrayIcon> g_deviceTrays;
+
+void UpdateTrayIcons();
 int g_dpi = 96;
 int g_hover = -1;
 bool g_tracking = false;
@@ -132,12 +117,12 @@ std::map<std::wstring, RowAnim> g_anims;
 std::vector<Reading> g_lastFresh;    // 最近一次扫描的完整列表（决定最终顺序）
 std::vector<Reading> g_pendingAdds;  // 等离场收完再进场的设备
 
-const int LOGICAL_W = 400;
-const int HEADER_H = 68;
-const int ROW_H = 64;
-const int FOOTER_H = 48;
+const int LOGICAL_W = 420;
+const int HEADER_H = 84;
+const int ROW_H = 78;
+const int FOOTER_H = 52;
 const int PAD = 18;
-const int MAX_ROWS = 5;
+const int MAX_ROWS = 4;
 const int EMPTY_H = 176;
 const int CORNER = 16;
 // 阴影余量必须大于"模糊扩散 + 下移"，否则阴影会在窗口边缘被切平
@@ -283,43 +268,33 @@ void DrawKindIcon(Graphics& g, Kind kind, RectF box, uint32_t color, float alpha
 
 // ------------------------------------------------------------------ 图标
 
-// 图标只有一个样子：和 exe 完全相同的墨底 + 白闪电，**不随主题反色**。
-// 之前按任务栏明暗翻成白底黑闪电，结果深色下托盘是白的、提示卡是黑的，
-// 同一个程序出现两套视觉，自己跟自己打架。
-// 唯一按主题调整的是深色下补一圈 1px 描边：墨底和深色任务栏太接近，
-// 没有轮廓就只剩一个白闪电悬在任务栏上。
+// 唯一的品牌标识：墨蓝圆角底、青绿闪电和能量弧线。
+// 托盘、仪表盘、提示卡与 .ico 都调用这里；调用方只负责统一缩放和定位。
 void DrawChipGlyph(Graphics& g, float s, bool dark) {
-    GraphicsPath bg;
-    MakeRoundRect(bg, 0.7f * s, 0.7f * s, 22.6f * s, 22.6f * s, 6.8f * s);
-    SolidBrush fill(C(0x1D1D1F));
-    g.FillPath(&fill, &bg);
+    GraphicsPath tile;
+    MakeRoundRect(tile, 0.7f * s, 0.7f * s, 22.6f * s, 22.6f * s, 6.6f * s);
+    LinearGradientBrush background(RectF(0, 0, 24.0f * s, 24.0f * s),
+                                   C(0x263A46), C(0x111A22), LinearGradientModeVertical);
+    g.FillPath(&background, &tile);
+    Pen edge(C(0xB8D4DB, dark ? 55 : 90), std::max(0.55f, 0.5f * s));
+    g.DrawPath(&edge, &tile);
 
-    if (dark) {
-        Pen edge(C(0xFFFFFF, 66), std::max(1.0f, 0.8f * s));   // 25% 白，16px 下也留得住轮廓
-        edge.SetLineJoin(LineJoinRound);
-        g.DrawPath(&edge, &bg);
-    }
-
-    PointF v[] = {
-        PointF(14.6f * s, 3.8f * s), PointF(9.4f * s, 12.4f * s),
-        PointF(12.3f * s, 12.4f * s), PointF(10.6f * s, 19.6f * s),
-        PointF(15.6f * s, 10.4f * s), PointF(12.6f * s, 10.4f * s),
+    PointF bolt[] = {
+        PointF(14.03f * s, 4.13f * s), PointF(6.83f * s, 13.50f * s),
+        PointF(11.03f * s, 13.50f * s), PointF(9.68f * s, 19.50f * s),
+        PointF(17.25f * s, 10.20f * s), PointF(12.75f * s, 10.20f * s),
     };
-    SolidBrush bolt(C(0xFFFFFF));
-    g.FillPolygon(&bolt, v, 6);
+    LinearGradientBrush energy(RectF(6.75f * s, 3.75f * s, 10.5f * s, 15.75f * s),
+                               C(0x75E6B1), C(0x2CC7B5), LinearGradientModeVertical);
+    g.FillPolygon(&energy, bolt, 6);
+
+    Pen arc(C(0x8CE8C2, 185), 1.125f * s);
+    arc.SetStartCap(LineCapRound);
+    arc.SetEndCap(LineCapRound);
+    g.DrawArc(&arc, RectF(4.5f * s, 4.5f * s, 15.0f * s, 15.0f * s), 32.0f, 48.0f);
 }
 
-HICON MakeTrayIcon(int size) {
-    Bitmap bmp(size, size, PixelFormat32bppARGB);
-    Graphics g(&bmp);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(TextRenderingHintAntiAlias);
-    g.Clear(Color(0, 0, 0, 0));
-    // 托盘图标 = 程序图标，恒定不变。
-    // 托盘里放会变的数字会一直抓到余光，而且和 exe 图标不是同一个东西。
-    // 电量看面板、悬停提示和低电量提醒。
-    DrawChipGlyph(g, (float)size / 24.0f, g_dark);
-
+HICON BitmapIcon(Bitmap& bmp, int size) {
     HBITMAP color = nullptr;
     bmp.GetHBITMAP(Color(0, 0, 0, 0), &color);
     HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
@@ -333,6 +308,82 @@ HICON MakeTrayIcon(int size) {
     return icon;
 }
 
+uint32_t TrayLevelColor(const Reading* d) {
+    if (!d || !d->online) return g_dark ? 0xB9BDC7 : 0x727986;
+    if (d->charging == 1) return g_dark ? 0x65DB8B : 0x16874A;
+    if (d->level <= 10) return g_dark ? 0xFF7770 : 0xD83B40;
+    if (d->level <= 20) return g_dark ? 0xFFB75B : 0xC46806;
+    return g_dark ? 0xF7F8FC : 0x18222E;
+}
+
+void DrawBolt(Graphics& g, RectF b, uint32_t color) {
+    PointF v[] = {
+        PointF(b.X + b.Width * 0.60f, b.Y),
+        PointF(b.X + b.Width * 0.13f, b.Y + b.Height * 0.58f),
+        PointF(b.X + b.Width * 0.46f, b.Y + b.Height * 0.58f),
+        PointF(b.X + b.Width * 0.36f, b.Y + b.Height),
+        PointF(b.X + b.Width * 0.87f, b.Y + b.Height * 0.40f),
+        PointF(b.X + b.Width * 0.53f, b.Y + b.Height * 0.40f),
+    };
+    SolidBrush brush(C(color));
+    g.FillPolygon(&brush, v, 6);
+}
+
+HICON MakeDeviceTrayIcon(const Reading& d, int size) {
+    // 通知区是正方形，不能假设它有普通任务栏按钮的宽度。所有内容按 32px
+    // 母版排布，再给 Explorer 缩放；不要同时画图案、侧边数字和电量条，
+    // 那三样东西在最终 16px 的图标里都会只剩一团灰。
+    const int canvas = std::max(32, size);
+    Bitmap bmp(canvas, canvas, PixelFormat32bppARGB);
+    Graphics g(&bmp);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    g.Clear(Color(0, 0, 0, 0));
+    const float s = canvas / 32.0f;
+    const uint32_t ink = TrayLevelColor(&d);
+    const uint32_t glyphInk = d.online ? (g_dark ? 0xF4F5F7 : 0x303943) : 0x8C949F;
+
+    // 尽量用满 Explorer 分配的正方形：设备图标不再缩在中央的小格子里，
+    // 数字贴近下缘但保留 1px 余量，避免在 16px 通知区被裁掉。
+    DrawKindIcon(g, d.kind, RectF(7.0f * s, 0.0f, 18.0f * s, 18.0f * s),
+                 glyphInk, d.online ? 1.0f : 0.65f);
+    const std::wstring pct = d.level >= 0 ? std::to_wstring(d.level) + L"%" : L"--";
+    // 以实际像素宽度定字号；GDI+ 默认字符串框含两侧的排版留白，
+    // 在 16px 方形图标里会把首尾字形裁掉，必须显式去掉。
+    const float fontPx = (d.level >= 100 ? 15.0f : 21.0f) * s;
+    Font font(L"Arial", fontPx, FontStyleBold, UnitPixel);
+    StringFormat sf;
+    sf.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsNoFontFallback |
+                      StringFormatFlagsMeasureTrailingSpaces);
+    sf.SetAlignment(StringAlignmentCenter);
+    sf.SetLineAlignment(StringAlignmentCenter);
+    RectF measured;
+    CharacterRange range(0, (INT)pct.size());
+    sf.SetMeasurableCharacterRanges(1, &range);
+    Region glyphRegion;
+    g.MeasureCharacterRanges(pct.c_str(), -1, &font,
+                             RectF(0, 0, 256.0f * s, 64.0f * s), &sf, 1, &glyphRegion);
+    glyphRegion.GetBounds(&measured, &g);
+    const float drawW = 32.0f * s;
+    const float offset = (drawW - measured.Width) * 0.5f - measured.X;
+    SolidBrush text(C(ink, d.online ? 255 : 175));
+    g.DrawString(pct.c_str(), -1, &font,
+                 RectF(offset, 15.0f * s, drawW, 17.0f * s), &sf, &text);
+    g.Flush(FlushIntentionSync);
+
+    if (!d.online) {
+        Pen off(C(0xE45A5F), std::max(1.2f, 1.5f * s));
+        off.SetStartCap(LineCapRound);
+        off.SetEndCap(LineCapRound);
+        g.DrawLine(&off, 10.0f * s, 15.0f * s, 22.0f * s, 1.0f * s);
+    } else if (d.charging == 1) {
+        // 闪电独立于数字，避免给三位数再抢占宽度。
+        DrawBolt(g, RectF(22.0f * s, 1.0f * s, 7.0f * s, 12.0f * s), ink);
+    }
+    return BitmapIcon(bmp, canvas);
+}
+
 // ------------------------------------------------------------------ 面板绘制
 
 int PanelWidth() { return S(LOGICAL_W); }
@@ -341,7 +392,7 @@ int PanelHeight(int count) {
     int rows = std::min(count, MAX_ROWS);
     int listH = count > 0 ? rows * S(ROW_H) + S(4) : S(EMPTY_H);
     int h = S(HEADER_H) + 1 + listH + 1 + S(FOOTER_H);
-    return std::min(h, S(560));
+    return std::min(h, S(600));
 }
 
 int AnimatedRowHeight(const std::wstring& key) {
@@ -363,7 +414,7 @@ int PanelHeightNow() {
         }
     }
     int h = S(HEADER_H) + 1 + listH + 1 + S(FOOTER_H);
-    return std::min(h, S(560));
+    return std::min(h, S(600));
 }
 
 // 窗口比卡片大一圈：四周的余量用来画柔和阴影。所有定位、命中测试
@@ -447,18 +498,41 @@ void DrawContent(Graphics& g, int w, int h) {
             if (d.level >= 0 && (lowest < 0 || d.level < lowest)) lowest = d.level;
         }
 
-        // ---- 顶部
-        Font* fTitle = GetFont(16.0f * dpi, FW_BOLD);
-        Font* fSub = GetFont(11.5f * dpi, FW_NORMAL);
+        // ---- 顶部：品牌、当前托盘焦点和窗口操作各占一层。
+        Font* fTitle = GetFont(18.0f * dpi, FW_BOLD);
+        Font* fSub = GetFont(11.0f * dpi, FW_NORMAL);
+        {
+            GraphicsState brand = g.Save();
+            g.TranslateTransform((REAL)S(PAD), (REAL)S(17));
+            DrawChipGlyph(g, S(28) / 24.0f, g_dark);
+            g.Restore(brand);
+        }
         DrawStr(g, L"余电", fTitle, g_colors.text,
-                RectF((float)S(PAD), (float)S(12), (float)S(180), (float)S(24)),
-                StringAlignmentNear, StringAlignmentNear, false);
+                RectF((float)S(PAD + 34), (float)S(14), (float)S(150), (float)S(28)),
+                StringAlignmentNear, StringAlignmentCenter, false);
 
         std::wstring sub = std::to_wstring(online) + L" 台在线";
         if (lowest >= 0) sub += L" · 最低 " + std::to_wstring(lowest) + L"%";
         DrawStr(g, sub, fSub, g_colors.sub,
-                RectF((float)S(PAD), (float)S(38), (float)S(240), (float)S(16)),
+                RectF((float)S(PAD + 34), (float)S(43), (float)S(164), (float)S(17)),
                 StringAlignmentNear, StringAlignmentNear, false);
+
+        std::wstring focusText = L"通知区 · 每台设备独立显示";
+        float tagW = (float)S(152);
+        float tagX = (float)S(PAD + 34);
+        float tagY = (float)S(65);
+        if (!g_snapshot.empty()) {
+            GraphicsPath tag;
+            MakeRoundRect(tag, tagX, tagY - (float)S(5), tagW, (float)S(17), (float)S(6));
+            SolidBrush tagBg(C(Mix(g_colors.tile, g_colors.accent, 0.09f)));
+            g.FillPath(&tagBg, &tag);
+            SolidBrush dot(C(g_colors.accent));
+            g.FillEllipse(&dot, tagX + (float)S(7), tagY + (float)S(1),
+                          (float)S(5), (float)S(5));
+        }
+        DrawStr(g, focusText, GetFont(9.5f * dpi, FW_NORMAL), g_colors.accent,
+                RectF(tagX + (float)S(16), tagY - (float)S(5), tagW - (float)S(20),
+                      (float)S(17)), StringAlignmentNear, StringAlignmentCenter, false);
 
         // 右上角两颗按钮。位置从右往左排：最右永远是关闭，刷新在它左边。
         float btn = (float)S(28);
@@ -543,17 +617,18 @@ void DrawContent(Graphics& g, int w, int h) {
                           (float)(w - S(PAD) * 2), (float)S(16)),
                     StringAlignmentCenter, StringAlignmentNear);
         } else {
-            Font* fName = GetFont(13.0f * dpi, FW_NORMAL);
-            Font* fMeta = GetFont(11.0f * dpi, FW_NORMAL);
-            Font* fPct = GetFont(15.5f * dpi, FW_BOLD, 1);
+            Font* fName = GetFont(13.0f * dpi, FW_SEMIBOLD);
+            Font* fMeta = GetFont(10.5f * dpi, FW_NORMAL);
+            Font* fPct = GetFont(21.0f * dpi, FW_BOLD, 1);
+            Font* fState = GetFont(9.5f * dpi, FW_NORMAL);
 
             int visible = VisibleRows();
             float rightEdge = (float)(w - S(PAD));
-            float pctW = (float)S(46);
+            float pctW = (float)S(58);
             float pctX = rightEdge - pctW;
             float pillW = (float)S(28), pillH = (float)S(12);
-            float pillX = pctX - (float)S(12) - pillW;
-            float textW = pillX - (float)S(56) - (float)S(12);
+            float pillX = pctX - (float)S(10) - pillW;
+            float textW = pillX - (float)S(70) - (float)S(12);
 
             // 行高是动画的：进入从 0 长到 ROW_H，离场缩回 0。
             // 内容按整行高度画，再裁到当前高度——这样文字不会被压扁，
@@ -582,25 +657,35 @@ void DrawContent(Graphics& g, int w, int h) {
                 GraphicsState clip = g.Save();
                 g.SetClip(RectF(0.0f, top, (float)w, rowH));
 
-                // 行悬停：淡入的高亮块，比直接切颜色柔和
-                float hov = (i == g_hover) ? g_animHover[3] * alpha : 0.0f;
-                if (hov > 0.01f) {
-                    GraphicsPath hp;
-                    MakeRoundRect(hp, (float)S(8), top + (float)S(4),
-                                  (float)(w - S(16)), (float)S(ROW_H - 8), (float)S(10));
-                    SolidBrush hb(C(g_colors.hover, (BYTE)std::lround(255.0f * hov)));
-                    g.FillPath(&hb, &hp);
+                // 轻量卡片承载一行；通知区已为每台设备显示独立图标，不再设单选焦点。
+                float hov = (di == g_hover) ? g_animHover[3] : 0.0f;
+                GraphicsPath tile;
+                MakeRoundRect(tile, (float)S(10), top + (float)S(4),
+                              (float)(w - S(20)), (float)S(ROW_H - 8), (float)S(12));
+                uint32_t tileColor = Mix(g_colors.tile, g_colors.hover, hov * 0.75f);
+                SolidBrush tileBrush(C(tileColor, (BYTE)std::lround(255 * alpha)));
+                g.FillPath(&tileBrush, &tile);
+
+                float iy = top + ((float)S(ROW_H) - (float)S(40)) / 2.0f;
+                GraphicsPath iconTile;
+                MakeRoundRect(iconTile, (float)S(19), iy, (float)S(40), (float)S(40),
+                              (float)S(12));
+                SolidBrush iconBg(C(Mix(g_colors.bg, g_colors.accent, d.online ? 0.045f : 0.0f),
+                                    (BYTE)std::lround(255 * alpha)));
+                g.FillPath(&iconBg, &iconTile);
+                DrawKindIcon(g, d.kind,
+                             RectF((float)S(27), iy + (float)S(8), (float)S(24), (float)S(24)),
+                             d.online ? g_colors.accent : g_colors.sub, alpha);
+                if (d.charging == 1 && d.online) {
+                    SolidBrush chargeBg(C(g_colors.tile, (BYTE)std::lround(255 * alpha)));
+                    g.FillEllipse(&chargeBg, (float)S(44), iy + (float)S(26),
+                                  (float)S(16), (float)S(16));
+                    DrawBolt(g, RectF((float)S(48), iy + (float)S(29),
+                                      (float)S(8), (float)S(10)), g_colors.ok);
                 }
 
-                // 品类图标：不垫色块，苹果列表里图标就是图标
-                float iy = top + ((float)S(ROW_H) - (float)S(22)) / 2.0f;
-                DrawKindIcon(g, d.kind,
-                             RectF((float)S(PAD), iy, (float)S(22), (float)S(22)),
-                             d.online ? g_colors.sub : Mix(g_colors.sub, g_colors.bg, 0.55f),
-                             alpha);
-
                 uint32_t nameColor = d.online ? g_colors.text : g_colors.sub;
-                RectF nameRect((float)S(56), top + (float)S(12), textW, (float)S(20));
+                RectF nameRect((float)S(70), top + (float)S(16), textW, (float)S(21));
 
                 Font* fNameRow = fName;
                 RectF measured;
@@ -612,29 +697,15 @@ void DrawContent(Graphics& g, int w, int h) {
                 DrawStr(g, d.name, fNameRow, nameColor, nameRect,
                         StringAlignmentNear, StringAlignmentCenter, true, alpha);
 
-                std::wstring meta = d.transport;
-                if (!d.vendor.empty()) {
-                    if (!meta.empty()) meta += L" · ";
-                    meta += d.vendor;
-                }
-                if (!meta.empty()) meta += L" · ";
-                // 缓存值（休眠中、或 BLE 这一轮没刷新）必须把年龄摆出来，
-                // 否则"设备休眠 · 82%"会被读成"刚刚读到 82%"。
-                if (d.online && !d.stale) {
-                    meta += d.StatusText();
-                } else {
-                    meta += d.StatusText() + L" · 上次 " + d.AgeText();
-                }
-                // 只有电压的设备必须写清百分比从哪来：G913/G915 用的是 G HUB
-                // 官方曲线（和官方软件同源），其余罗技型号用通用表。
-                // 设备自报的（迈从 / 飞智 / 索尼等）两者都不标。
+                std::wstring meta = d.transport.empty() ? KindLabel(d.kind) : d.transport;
+                if (!d.vendor.empty()) meta += L" · " + d.vendor;
                 if (d.level >= 0) {
-                    // 面板一行放不下「G HUB 官方曲线」，缩写；全称在 detail 里。
                     if (d.officialCurve) meta += L" · 官方曲线";
                     else if (d.approximate) meta += L" · 电压估算";
                 }
+                if (!d.online || d.stale) meta += L" · 上次 " + d.AgeText();
                 DrawStr(g, meta, fMeta, g_colors.sub,
-                        RectF((float)S(56), top + (float)S(35), textW, (float)S(15)),
+                        RectF((float)S(70), top + (float)S(42), textW, (float)S(17)),
                         StringAlignmentNear, StringAlignmentCenter, true, alpha);
 
                 // 颜色只在两种情况下出现：低电量告警、充电中。
@@ -663,16 +734,14 @@ void DrawContent(Graphics& g, int w, int h) {
                               pctW + (float)S(16) + pctExtra, (float)S(22)),
                         StringAlignmentFar, StringAlignmentCenter, false, alpha);
 
-                float pillY = top + ((float)S(ROW_H) - pillH) / 2.0f;
+                float pillY = top + (float)S(23);
                 DrawBatteryPill(g, pillX, pillY, pillW, pillH, d.level, lvlInk, alpha);
-
-                if (i < visible - 1 && di < count - 1) {
-                    // 分隔线跟着"当前行高"走，展开过程中也能看清行的边界
-                    float sepA = leavingRow ? alpha : std::min(1.0f, p * 2.0f);
-                    Pen sep(C(g_colors.border, (BYTE)std::lround(255.0f * sepA)), 1.0f);
-                    g.DrawLine(&sep, (float)S(56), top + rowH + 0.5f,
-                               rightEdge, top + rowH + 0.5f);
-                }
+                std::wstring state = !d.online ? L"离线"
+                    : (d.charging == 1 ? L"充电中" : (d.level < 0 ? L"未读取" : d.StatusText()));
+                DrawStr(g, state, fState, lvlInk,
+                        RectF(pillX - (float)S(10), top + (float)S(42),
+                              rightEdge - pillX + (float)S(10), (float)S(16)),
+                        StringAlignmentFar, StringAlignmentCenter, false, alpha);
 
                 g.Restore(clip);
                 top += rowH;
@@ -717,17 +786,17 @@ void DrawContent(Graphics& g, int w, int h) {
             goto footer_switch;
         }
         if (g_lastUpdate == 0) {
-            swprintf(stamp, 96, L"--:--:-- 更新 · %d %s自动刷新",
+            swprintf(stamp, 96, L"等待更新 · 每 %d %s",
                      iv >= 60 ? iv / 60 : iv, iv >= 60 ? L"分钟" : L"秒");
         } else {
             struct tm tmv;
             localtime_s(&tmv, &g_lastUpdate);
             if (iv >= 60) {
-                swprintf(stamp, 96, L"%02d:%02d:%02d 更新 · %d 分钟自动刷新",
-                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec, iv / 60);
+                swprintf(stamp, 96, L"%02d:%02d 更新 · 每 %d 分钟",
+                         tmv.tm_hour, tmv.tm_min, iv / 60);
             } else {
-                swprintf(stamp, 96, L"%02d:%02d:%02d 更新 · %d 秒自动刷新",
-                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec, iv);
+                swprintf(stamp, 96, L"%02d:%02d 更新 · 每 %d 秒",
+                         tmv.tm_hour, tmv.tm_min, iv);
             }
         }
         DrawStr(g, stamp, fFoot, g_colors.sub,
@@ -1081,26 +1150,38 @@ bool RenderFrameTo(const wchar_t* path) {
 
 // 把运行时托盘图标按不同电量渲染成一条对比图，用于检查小尺寸观感
 int RenderTrayStripImpl(const wchar_t* path) {
-    SetThemePalette(false);
     const int sizes[] = {16, 20, 24, 32, 40, 48};
+    const int levels[] = {8, 18, 52, 76, 91, 100};
+    const Kind kinds[] = {Kind::Keyboard, Kind::Controller, Kind::Mouse,
+                          Kind::Mouse, Kind::Headset, Kind::Keyboard};
     const int n = 6;
-    const int cell = 84, pad = 18, rowH = 84;
+    const int cell = 144, pad = 18, rowH = 104;
     Bitmap canvas(cell * n + pad * 2, rowH * 2 + pad * 2, PixelFormat32bppARGB);
     Graphics g(&canvas);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.Clear(Color(255, 246, 246, 248));
+    g.Clear(Color(255, 239, 243, 248));
     SolidBrush darkRow(Color(255, 32, 32, 32));
     g.FillRectangle(&darkRow, 0, pad + rowH, cell * n + pad * 2, rowH);
 
     for (int row = 0; row < 2; ++row) {
+        SetThemePalette(row == 1);
         for (int i = 0; i < n; ++i) {
+            Reading d;
+            d.kind = kinds[i];
+            d.level = levels[i];
+            d.charging = i == 4 ? 1 : 0;
+            d.online = i != 1;
+            g_snapshot = {d};
             int sz = sizes[i];
             int px = pad + i * cell + (cell - sz) / 2;
-            int py = pad + row * rowH + (rowH - sz) / 2;
-            GraphicsState st = g.Save();
-            g.TranslateTransform((REAL)px, (REAL)py);
-            DrawChipGlyph(g, (float)sz / 24.0f, row == 1);
-            g.Restore(st);
+            int py = pad + row * rowH + 8;
+            HICON icon = MakeDeviceTrayIcon(d, sz);
+            {
+                HDC hdc = g.GetHDC();
+                DrawIconEx(hdc, px, py, icon, sz, sz, 0, nullptr, DI_NORMAL);
+                g.ReleaseHDC(hdc);
+            }
+            DestroyIcon(icon);
         }
     }
 
@@ -1578,7 +1659,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             bool overButton = overRefresh || overClose || overQuit || overSwitch;
             bool inHeader = pt.y >= 0 && pt.y < S(HEADER_H);
 
-            SetCursor(LoadCursor(nullptr, overButton ? IDC_HAND
+            SetCursor(LoadCursor(nullptr, (overButton || g_hover >= 0) ? IDC_HAND
                                           : (inHeader ? IDC_SIZEALL : IDC_ARROW)));
 
             int mask = (overRefresh ? 1 : 0) | (overClose ? 2 : 0) | (overQuit ? 4 : 0);
@@ -1771,6 +1852,11 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 PostMessageW(g_mainWnd, WM_COMMAND, IDM_AUTOSTART, 0);
                 return 0;
             }
+            int row = HitRowIndex(pt.y);
+            if (row >= 0 && row < (int)g_display.size()) {
+                // 每台设备已有独立通知区图标；面板行保留原有展示，不再切换单图标焦点。
+                return 0;
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -1789,6 +1875,7 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DPICHANGED: {
             g_dpi = HIWORD(wp);
             ClearFontCache();                 // 旧尺寸的字体全部作废
+            UpdateTrayIcons();                // Explorer 的小图标尺寸也会随 DPI 改变
             // 拖动跨到另一块缩放不同的显示器时，别在这里重排——
             // PlacePanel 会按"记住的位置/右下角"把正在拖的面板拽回去
             if (!g_dragging) PlacePanel(hwnd, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
@@ -1838,39 +1925,82 @@ void EnsurePanel() {
                               g_mainWnd, nullptr, g_inst, nullptr);
 }
 
-void UpdateTrayIcon() {
-    int size = GetSystemMetrics(SM_CXSMICON);
-    HICON icon = MakeTrayIcon(size > 0 ? size : 16);
+void DeleteLegacyTrayIcons() {
+    // 仅清理旧版的独立电量图标；TRAY_UID 现在是唯一的程序入口，不能误删。
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = g_mainWnd;
+    nid.uID = TRAY_BATTERY_UID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+void DeleteCombinedTrayIcons() {
+    // 版式 1 的 uid 对应被 Explorer 缓存的旧位图，退出和启动时都要清理。
+    for (const auto& d : g_snapshot) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = g_mainWnd;
+        nid.uID = LegacyTrayUidFor(d.key);
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+HICON MakeProgramTrayIcon(int size) {
+    const int canvas = std::max(32, size);
+    Bitmap bmp(canvas, canvas, PixelFormat32bppARGB);
+    Graphics g(&bmp);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    g.Clear(Color(0, 0, 0, 0));
+    // 与仪表盘完全相同的品牌绘制，不再维护第二套图形。
+    DrawChipGlyph(g, canvas / 24.0f, g_dark);
+    g.Flush(FlushIntentionSync);
+    return BitmapIcon(bmp, canvas);
+}
+
+bool SetTrayIcon(DeviceTrayIcon* entry, HICON icon) {
     NOTIFYICONDATAW nid{};
     nid.cbSize = sizeof(nid);
     nid.hWnd = g_mainWnd;
     nid.uID = TRAY_UID;
-    nid.uFlags = NIF_ICON;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAYMSG;
     nid.hIcon = icon;
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
-    if (g_trayIcon) DestroyIcon(g_trayIcon);
-    g_trayIcon = icon;
+    CopyW(nid.szTip, 128, L"余电 · 外设电量仪表盘\n左键打开仪表盘 · 右键设置");
+    const UINT operation = entry->added ? NIM_MODIFY : NIM_ADD;
+    const bool ok = Shell_NotifyIconW(operation, &nid) != FALSE;
+    if (ok) entry->added = true;
+    return ok;
 }
 
-std::wstring BuildTooltip() {
-    if (g_snapshot.empty()) return L"余电：未发现可读取电量的设备";
-    std::wstring s = L"余电";
-    int n = 0;
-    for (auto& d : g_snapshot) {
-        if (n++ >= 6) break;
-        s += L"\n";
-        s += d.name;
-        s += L"  ";
-        s += (d.level >= 0)
-                 ? ((d.approximate && !d.officialCurve ? L"≈" : L"") +
-                    std::to_wstring(d.level) + L"%")
-                 : L"--";
-        if (!d.online) s += L"（休眠）";
-        else if (d.charging == 1) s += L"（充电中）";
+void UpdateTrayIcons() {
+    int size = GetSystemMetrics(SM_CXSMICON);
+    if (size <= 0) size = 16;
+
+    // 设备身份从通知区退出：托盘只承担程序入口，设备状态由任务栏透明条显示。
+    for (auto it = g_deviceTrays.begin(); it != g_deviceTrays.end();) {
+        if (it->first == L"program") {
+            ++it;
+            continue;
+        }
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = g_mainWnd;
+        nid.uID = it->second.uid;
+        if (it->second.added) Shell_NotifyIconW(NIM_DELETE, &nid);
+        if (it->second.icon) DestroyIcon(it->second.icon);
+        it = g_deviceTrays.erase(it);
     }
-    if (g_snapshot.size() > 6) s += L"\n…另有 " + std::to_wstring(g_snapshot.size() - 6) + L" 台";
-    if (s.size() > 120) s = s.substr(0, 120);
-    return s;
+
+    auto& entry = g_deviceTrays[L"program"];
+    entry.uid = TRAY_UID;
+    HICON icon = MakeProgramTrayIcon(size);
+    if (SetTrayIcon(&entry, icon)) {
+        if (entry.icon) DestroyIcon(entry.icon);
+        entry.icon = icon;
+    } else {
+        DestroyIcon(icon);
+    }
 }
 
 // 系统菜单窗口的类名是 #32768，它由 comctl32 画，默认方角 + 1px 硬边，
@@ -1924,7 +2054,13 @@ bool IsDarkTheme() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
                       L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
                       0, KEY_READ, &key) == ERROR_SUCCESS) {
-        RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type, (LPBYTE)&value, &size);
+        // Win10 允许“浅色应用 + 深色系统任务栏”，自动模式优先跟随任务栏。
+        if (RegQueryValueExW(key, L"SystemUsesLightTheme", nullptr, &type,
+                             (LPBYTE)&value, &size) != ERROR_SUCCESS) {
+            value = 1;
+            size = sizeof(value);
+            RegQueryValueExW(key, L"AppsUseLightTheme", nullptr, &type, (LPBYTE)&value, &size);
+        }
         RegCloseKey(key);
     }
     return value == 0;
@@ -1934,6 +2070,10 @@ void SetThemePalette(bool dark) {
     g_dark = dark;
     g_colors = dark ? kDark : kLight;
 }
+
+void OverlayRefresh();
+void OverlayCreate();
+void OverlayDestroy();
 
 void RefreshTheme() {
     SetThemePalette(IsDarkTheme());
@@ -1947,37 +2087,386 @@ void UiRebuildTheme() {
     g_shadowW = g_shadowH = 0;
     if (g_panel) InvalidateRect(g_panel, nullptr, FALSE);
     UiRefreshToastTheme();      // 提示卡还开着的话，跟着换色，别留一张白卡贴在深色桌面上
-    UpdateTrayIcon();
+    UpdateTrayIcons();
+    OverlayRefresh();
+}
+
+// ------------------------------------------------------------------ 浮动任务栏电量条
+//
+// Windows 11 已移除 Deskband，不能真正嵌入任务栏。这里使用普通置顶窗口：
+// 不经过分层窗口 / UpdateLayeredWindow，直接由 WM_PAINT 输出完整的横向电量条。
+// 窗口只贴在主任务栏上缘，不修改 Explorer、任务栏设置或系统文件。
+
+const wchar_t* OVERLAY_CLASS = L"PeripheralBattery.Overlay";
+HWND g_overlay = nullptr;
+HDC g_overlayDc = nullptr;
+HBITMAP g_overlayBitmap = nullptr;
+HGDIOBJ g_overlayOldBitmap = nullptr;
+void* g_overlayBits = nullptr;
+int g_overlayW = 0;
+int g_overlayH = 0;
+int g_overlayDpi = 96;
+HWND g_overlayTaskbar = nullptr;
+int g_overlayX = -1;
+int g_overlayY = -1;
+std::wstring g_overlayContentKey;
+bool g_overlayDetached = false;
+bool g_overlayDragging = false;
+POINT g_overlayDragOffset{};
+
+int OverlayScale(int value) {
+    return MulDiv(value, g_overlayDpi, 96);
+}
+
+int OverlayWidth() {
+    int width = OverlayScale(20);
+    if (g_snapshot.empty()) return OverlayScale(156);
+    const size_t count = g_snapshot.size();
+    for (size_t i = 0; i < count; ++i) {
+        const auto& d = g_snapshot[i];
+        width += OverlayScale(26) + OverlayScale(d.level >= 100 ? 50 : 42);
+    }
+    width += ((int)count - 1) * OverlayScale(18);
+    return width;
+}
+
+void OverlayDraw(HDC dc, int height) {
+    Graphics g(dc);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.Clear(Color(0, 0, 0, 0));
+
+    const float scale = g_overlayDpi / 96.0f;
+    const float mid = height / 2.0f;
+    float x = 10.0f * scale;
+
+    if (g_snapshot.empty()) {
+        Font font(L"Microsoft YaHei UI", 14.0f * scale, FontStyleRegular, UnitPixel);
+        SolidBrush text(Color(255, 190, 196, 205));
+        g.DrawString(L"余电 · 等待设备", -1, &font,
+                     PointF(x, mid - 9.0f * scale), &text);
+        return;
+    }
+
+    const size_t count = g_snapshot.size();
+    for (size_t i = 0; i < count; ++i) {
+        const auto& d = g_snapshot[i];
+        const uint32_t glyphInk = d.online ? (g_dark ? 0xF4F5F7 : 0x27323D) : 0x7D8792;
+        DrawKindIcon(g, d.kind,
+                     RectF(x, mid - 11.0f * scale, 22.0f * scale, 22.0f * scale),
+                     glyphInk, d.online ? 1.0f : 0.65f);
+
+        const std::wstring pct = d.level >= 0 ? std::to_wstring(d.level) + L"%" : L"--";
+        Font font(L"Segoe UI", 18.0f * scale, FontStyleBold, UnitPixel);
+        const uint32_t ink = TrayLevelColor(&d);
+        SolidBrush text(C(ink, d.online ? 255 : 180));
+        StringFormat sf;
+        sf.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
+        sf.SetLineAlignment(StringAlignmentCenter);
+        g.DrawString(pct.c_str(), -1, &font,
+                     RectF(x + 27.0f * scale, 0, 54.0f * scale, (float)height), &sf, &text);
+        x += 27.0f * scale + (d.level >= 100 ? 50.0f : 42.0f) * scale;
+
+        if (i + 1 < count) {
+            Pen divider(Color(150, g_dark ? 210 : 75, g_dark ? 216 : 83, g_dark ? 226 : 93), 1.0f);
+            g.DrawLine(&divider, x + 8.0f * scale, mid - 9.0f * scale,
+                       x + 8.0f * scale, mid + 9.0f * scale);
+            x += 18.0f * scale;
+        }
+    }
+}
+
+bool OverlayEnsureSurface(int width, int height) {
+    if (g_overlayBitmap && g_overlayW == width && g_overlayH == height) return true;
+    if (g_overlayDc && g_overlayOldBitmap) SelectObject(g_overlayDc, g_overlayOldBitmap);
+    if (g_overlayBitmap) DeleteObject(g_overlayBitmap);
+    if (g_overlayDc) DeleteDC(g_overlayDc);
+    g_overlayOldBitmap = nullptr;
+    g_overlayBitmap = nullptr;
+    g_overlayDc = nullptr;
+    g_overlayBits = nullptr;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    g_overlayDc = CreateCompatibleDC(nullptr);
+    g_overlayBitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS,
+                                       &g_overlayBits, nullptr, 0);
+    if (!g_overlayDc || !g_overlayBitmap || !g_overlayBits) return false;
+    g_overlayOldBitmap = SelectObject(g_overlayDc, g_overlayBitmap);
+    if (!g_overlayOldBitmap || g_overlayOldBitmap == HGDI_ERROR) return false;
+    g_overlayW = width;
+    g_overlayH = height;
+    return true;
+}
+
+void OverlayRefresh() {
+    if (!g_config.overlay) return;
+    // 手动放置后是独立状态条，不再属于任务栏，Explorer 重启也不重置位置。
+    if (!g_overlayDetached) {
+        HWND currentTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (!currentTaskbar) {
+            OverlayDestroy();
+            return;
+        }
+        if (!g_overlay || g_overlayTaskbar != currentTaskbar) {
+            OverlayDestroy();
+            g_overlayTaskbar = currentTaskbar;
+            OverlayCreate();
+        }
+    }
+    if (!g_overlay) return;
+    HWND taskbar = g_overlayDetached ? FindWindowW(L"Shell_TrayWnd", nullptr) : g_overlayTaskbar;
+    if (!g_overlayDetached && (!taskbar || !IsWindowVisible(taskbar))) {
+        ShowWindow(g_overlay, SW_HIDE);
+        return;
+    }
+    if (g_overlayDragging) return;
+
+    RECT bar{};
+    GetWindowRect(taskbar, &bar);
+    RECT client{};
+    GetClientRect(taskbar, &client);
+    POINT origin{0, 0};
+    ClientToScreen(taskbar, &origin);
+    // GetDpiForWindow 需要 Win10 1607+；早期 Win10 或失效窗口回退系统 DPI。
+    g_overlayDpi = (int)GetDpiForWindow(taskbar);
+    if (g_overlayDpi <= 0) g_overlayDpi = GetDpiForSystem();
+    if (g_overlayDpi <= 0) g_overlayDpi = 96;
+    const int width = OverlayWidth();
+    const int barHeight = bar.bottom - bar.top;
+    const int height = std::min(OverlayScale(36), barHeight);
+    APPBARDATA appbar{};
+    appbar.cbSize = sizeof(appbar);
+    appbar.hWnd = taskbar;
+    const UINT edge = SHAppBarMessage(ABM_GETTASKBARPOS, &appbar) ? appbar.uEdge : ABE_BOTTOM;
+    const int rightSafe = bar.right - OverlayScale(330);
+    const int defaultX = rightSafe - width;
+    int x = defaultX;
+    int y = bar.top + (barHeight - height) / 2;
+    if (!g_overlayDetached && (edge == ABE_LEFT || edge == ABE_RIGHT)) {
+        ShowWindow(g_overlay, SW_HIDE);
+        return;
+    }
+    if (!g_overlayDetached) {
+        // 任务栏点击/双击会改变 Explorer 内部窗口的前后关系；每次刷新仅恢复原位，
+        // 不反复隐藏、销毁窗口，也不把普通点击当成离开任务栏。
+        SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else if (!IsWindowVisible(g_overlay)) {
+        ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
+    }
+    // 默认留在任务栏；用户主动拖动后保持手动位置，不跟随鼠标自动移动。
+    if (g_overlayDetached) {
+        x = g_overlayX;
+        y = g_overlayY;
+        HMONITOR monitor = MonitorFromPoint(POINT{x + width / 2, y + height / 2}, MONITOR_DEFAULTTONULL);
+        if (!monitor) {
+            // 拔掉显示器后把窗口放回主屏，避免无法再次抓住状态条。
+            monitor = MonitorFromPoint(POINT{bar.left + 1, bar.top + 1}, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(monitor, &mi)) {
+                x = std::max((int)mi.rcWork.left, std::min(x, (int)mi.rcWork.right - width));
+                y = std::max((int)mi.rcWork.top, std::min(y, (int)mi.rcWork.bottom - height));
+            }
+        }
+    }
+    if (!OverlayEnsureSurface(width, height)) return;
+
+    std::wstring contentKey = g_dark ? L"D;" : L"L;";
+    contentKey += std::to_wstring(g_overlayDpi) + L";";
+    for (const auto& d : g_snapshot) {
+        contentKey += std::to_wstring((int)d.kind) + L":" + std::to_wstring(d.level) +
+                      L":" + std::to_wstring(d.online ? 1 : 0) + L";";
+    }
+    // 纯位置变化只移动窗口，不重建 DIB、不切换置顶状态，避免移动时闪烁。
+    // UpdateLayeredWindow 会提交一次完整位置，因此位置变化时仍需提交原缓存内容。
+    const bool positionChanged = (x != g_overlayX || y != g_overlayY);
+    if (positionChanged) {
+        SetWindowPos(g_overlay, nullptr, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_overlayX = x;
+        g_overlayY = y;
+    }
+    if (contentKey != g_overlayContentKey) {
+        g_overlayContentKey = contentKey;
+        std::memset(g_overlayBits, 0, (size_t)width * (size_t)height * 4);
+        OverlayDraw(g_overlayDc, height);
+    }
+    POINT source{0, 0};
+    // Owned popup 使用屏幕坐标；owner 跟随任务栏，不占任务栏按钮、不抢前台。
+    (void)client;
+    (void)origin;
+    POINT destination{x, y};
+    SIZE size{width, height};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    UpdateLayeredWindow(g_overlay, nullptr, &destination, &size,
+                        g_overlayDc, &source, 0, &blend, ULW_ALPHA);
+}
+
+LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_PAINT: {
+            // 分层内容只在 OverlayRefresh 统一提交，WM_PAINT 不参与呈现。
+            PAINTSTRUCT ps{};
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NCHITTEST: {
+            // 分层窗口按像素透明放行：图标/数字可拖动，空白不挡下面应用。
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            if (pt.x < 0 || pt.y < 0 || pt.x >= g_overlayW || pt.y >= g_overlayH || !g_overlayBits)
+                return HTTRANSPARENT;
+            const auto* pixels = static_cast<const unsigned char*>(g_overlayBits);
+            const BYTE alpha = pixels[((size_t)pt.y * (size_t)g_overlayW + (size_t)pt.x) * 4 + 3];
+            return alpha > 16 ? HTCLIENT : HTTRANSPARENT;
+        }
+        case WM_LBUTTONDOWN: {
+            if (!g_overlay) return 0;
+            POINT cursor{};
+            if (!GetCursorPos(&cursor)) return 0;
+            g_overlayDragOffset.x = cursor.x - g_overlayX;
+            g_overlayDragOffset.y = cursor.y - g_overlayY;
+            g_overlayDragging = true;
+            // 按下只记录拖动起点。真正移动超过系统拖动阈值后才脱离任务栏，
+            // 单击、双击均不改变窗口 owner 或层级，避免状态条被任务栏盖住。
+            SetCapture(hwnd);
+            SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+            return 0;
+        }
+        case WM_MOUSEMOVE:
+            if (g_overlayDragging && (wp & MK_LBUTTON)) {
+                POINT cursor{};
+                if (!GetCursorPos(&cursor)) return 0;
+                const int newX = cursor.x - g_overlayDragOffset.x;
+                const int newY = cursor.y - g_overlayDragOffset.y;
+                if (!g_overlayDetached &&
+                    (abs(newX - g_overlayX) >= GetSystemMetrics(SM_CXDRAG) ||
+                     abs(newY - g_overlayY) >= GetSystemMetrics(SM_CYDRAG))) {
+                    g_overlayDetached = true;
+                    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+                g_overlayX = newX;
+                g_overlayY = newY;
+                SetWindowPos(hwnd, nullptr, g_overlayX, g_overlayY, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            } else if (g_overlayDragging) {
+                ReleaseCapture();
+                g_overlayDragging = false;
+            }
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_CAPTURECHANGED:
+            if (g_overlayDragging) {
+                g_overlayDragging = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                OverlayRefresh();
+            }
+            return 0;
+        case WM_TIMER:
+            if (wp == 1) OverlayRefresh();
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_DISPLAYCHANGE:
+        case WM_DPICHANGED:
+            OverlayRefresh();
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+void OverlayCreate() {
+    if (g_overlay || !g_config.overlay) return;
+    WNDCLASSW wc{};
+    wc.hInstance = g_inst;
+    wc.lpfnWndProc = OverlayProc;
+    wc.lpszClassName = OVERLAY_CLASS;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    RegisterClassW(&wc);
+
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!taskbar) return;
+    // 不使用 WS_EX_TRANSPARENT：它会从命中测试链中跳过整个窗口，导致无法主动拖动。
+    // 真正透明的像素仍由逐像素 Alpha 呈现，窗口不抢焦点。
+    g_overlay = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        OVERLAY_CLASS, L"余电任务栏电量", WS_POPUP,
+        0, 0, OverlayScale(156), OverlayScale(36),
+        g_overlayTaskbar, nullptr, g_inst, nullptr);
+    if (!g_overlay) return;
+    // 跟随任务栏自己的层级和显隐，不参与桌面前后台切换，避免点击后闪烁。
+    SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    OverlayRefresh();
+    SetTimer(g_overlay, 1, 200, nullptr);
+}
+
+void OverlayDestroy() {
+    g_overlayDragging = false;
+    if (g_overlay) {
+        KillTimer(g_overlay, 1);
+        DestroyWindow(g_overlay);
+        g_overlay = nullptr;
+    }
+    if (g_overlayDc && g_overlayOldBitmap) SelectObject(g_overlayDc, g_overlayOldBitmap);
+    if (g_overlayBitmap) DeleteObject(g_overlayBitmap);
+    if (g_overlayDc) DeleteDC(g_overlayDc);
+    g_overlayOldBitmap = nullptr;
+    g_overlayBitmap = nullptr;
+    g_overlayDc = nullptr;
+    g_overlayBits = nullptr;
+    g_overlayW = g_overlayH = 0;
+    g_overlayX = g_overlayY = -1;
+    g_overlayContentKey.clear();
+    g_overlayTaskbar = nullptr;
+}
+
+void UiSetOverlayVisible(bool visible) {
+    if (!visible) {
+        OverlayDestroy();
+        g_overlayDetached = false;
+        return;
+    }
+    OverlayCreate();
+    OverlayRefresh();
 }
 
 void UiCreate() {
     g_dpi = GetDpiForSystem();
     RefreshTheme();
 
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_mainWnd;
-    nid.uID = TRAY_UID;
-    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    nid.uCallbackMessage = WM_APP_TRAYMSG;
-    nid.hIcon = MakeTrayIcon(GetSystemMetrics(SM_CXSMICON));
-    CopyW(nid.szTip, 128, L"余电：正在读取…");
-    Shell_NotifyIconW(NIM_ADD, &nid);
-    if (g_trayIcon) DestroyIcon(g_trayIcon);
-    g_trayIcon = nid.hIcon;
+    DeleteLegacyTrayIcons();
+    DeleteCombinedTrayIcons();
+    UpdateTrayIcons();
+    OverlayCreate();
 }
 
 void UiDestroy() {
     ClearFontCache();
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_mainWnd;
-    nid.uID = TRAY_UID;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
-    if (g_trayIcon) {
-        DestroyIcon(g_trayIcon);
-        g_trayIcon = nullptr;
+    OverlayDestroy();
+    DeleteLegacyTrayIcons();
+    DeleteCombinedTrayIcons();
+    for (auto& kv : g_deviceTrays) {
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = g_mainWnd;
+        nid.uID = kv.second.uid;
+        if (kv.second.added) Shell_NotifyIconW(NIM_DELETE, &nid);
+        if (kv.second.icon) DestroyIcon(kv.second.icon);
     }
+    g_deviceTrays.clear();
 }
 
 void UiApplyDevices(const std::vector<Reading>& list, bool newData) {
@@ -2012,16 +2501,8 @@ void UiApplyDevices(const std::vector<Reading>& list, bool newData) {
         g_display = list;
         g_anims.clear();
     }
-    UpdateTrayIcon();
-
-    NOTIFYICONDATAW nid{};
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_mainWnd;
-    nid.uID = TRAY_UID;
-    nid.uFlags = NIF_TIP;
-    std::wstring tip = BuildTooltip();
-    CopyW(nid.szTip, 128, tip.c_str());
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    UpdateTrayIcons();
+    OverlayRefresh();
 
     g_scroll = std::max(0, std::min(ScrollMax(), g_scroll));   // 列表变短时收敛
 
@@ -2125,6 +2606,8 @@ void UiShowMenu(POINT pt) {
     AppendMenuW(menu, MF_STRING, IDM_SHOW,
                 UiPanelVisible() ? L"收起面板" : L"打开展示面板");
     AppendMenuW(menu, MF_STRING, IDM_REFRESH, L"立即刷新");
+    AppendMenuW(menu, MF_STRING | (g_config.overlay ? MF_CHECKED : MF_UNCHECKED),
+                IDM_OVERLAY, L"显示浮窗");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     MENUITEMINFOW mii{};
@@ -2146,6 +2629,13 @@ void UiShowMenu(POINT pt) {
         AppendMenuW(sub, flags, IDM_INTERVAL_BASE + i, label);
     }
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, L"刷新间隔");
+
+    HMENU tray = CreatePopupMenu();
+    AppendMenuW(tray, MF_STRING | MF_GRAYED, 0,
+                (L"通知区：每台设备一个图标（共 " + std::to_wstring(g_snapshot.size()) + L" 台）").c_str());
+    AppendMenuW(tray, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(tray, MF_STRING, IDM_TRAY_SETTINGS, L"打开任务栏通知区设置…");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)tray, L"任务栏显示");
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (g_config.panelX < 0 ? MF_GRAYED : 0), IDM_RESET_POS,
