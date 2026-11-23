@@ -152,6 +152,8 @@ void UiResetPanelPos();       // 面板回到默认右下角（右键菜单用�
 bool IsDarkTheme();
 void UiRebuildTheme();
 void UiSetOverlayVisible(bool visible);
+// 浮窗看门狗：主窗口周期性调用，负责在浮窗被意外销毁或隐藏后自动恢复。
+void UiOverlayWatchdog();
 
 // 扫描
 void MonitorScan(std::vector<Reading>* out);

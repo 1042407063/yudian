@@ -2074,6 +2074,7 @@ void SetThemePalette(bool dark) {
 void OverlayRefresh();
 void OverlayCreate();
 void OverlayDestroy();
+void OverlayRebuild();
 
 void RefreshTheme() {
     SetThemePalette(IsDarkTheme());
@@ -2113,6 +2114,27 @@ std::wstring g_overlayContentKey;
 bool g_overlayDetached = false;
 bool g_overlayDragging = false;
 POINT g_overlayDragOffset{};
+POINT g_overlayDragAnchor{};   // 按下时的屏幕坐标，拖动阈值按累计位移判断
+// 连续找不到任务栏 / 任务栏不可见的计数：用来把"瞬时抖动"和"真的没了"分开。
+// 旧实现任何一次失败都直接销毁或隐藏浮窗，Explorer 重启、全屏应用、切换显示器
+// 都会触发，表现就是浮窗时不时自己消失。
+int g_overlayTaskbarMiss = 0;
+int g_overlayTaskbarHidden = 0;
+// 防重入：OverlayCreate 内部会回调 OverlayRefresh，加锁避免同一轮里重复提交。
+bool g_overlayRefreshing = false;
+// 上一次真正提交给 UpdateLayeredWindow 的尺寸与内容，用来避免每 200ms 重复提交。
+int g_overlayCommitW = 0;
+int g_overlayCommitH = 0;
+std::wstring g_overlayCommitKey;
+// 拖动中把 owner 从任务栏改成桌面时，SetWindowLongPtr 会同步派发一次
+// WM_CAPTURECHANGED。若不区分，它会被当成"用户松手"而立刻结束拖动，
+// 表现就是浮窗只跟着光标挪一下就不动了。
+bool g_overlayOwnChanging = false;
+// 定时器判断"真的松手了"所需的连续读数次数。
+int g_overlayReleaseTicks = 0;
+// 最后一次收到鼠标消息的时间。用来区分"拖动还在继续但读不到按键"和
+// "LBUTTONUP 真的丢了"——前者不该结束拖动。
+ULONGLONG g_overlayLastMouseTick = 0;
 
 int OverlayScale(int value) {
     return MulDiv(value, g_overlayDpi, 96);
@@ -2204,78 +2226,117 @@ bool OverlayEnsureSurface(int width, int height) {
     return true;
 }
 
+// 只修复真实的可见性 / 置顶状态，不根据遮挡情况反复抢 z 序。
+//
+// 默认浮窗以任务栏为 owner。Win32 明确保证 owned window 始终位于 owner 之上，
+// 所以点击任务栏或切换任务栏应用时，Explorer 调整任务栏层级会带着浮窗一起走。
+// 旧实现把 owner 清空，再用定时器检测遮挡并 SetWindowPos 抢回顶层，实际上是在
+// 和 Explorer 拉锯：每次点击都会出现“被盖住 → 100ms 后抢回”的闪烁。
+// 手动拖出的浮窗没有 owner，仍按普通独立置顶窗处理；被其它置顶窗覆盖是正常行为，
+// 不应为了抢回可见性持续重排窗口。
+void OverlayEnsureVisible(bool topmost) {
+    if (!g_overlay) return;
+    const LONG_PTR ex = GetWindowLongPtrW(g_overlay, GWL_EXSTYLE);
+    const bool isTopmost = (ex & WS_EX_TOPMOST) != 0;
+    const bool visible = IsWindowVisible(g_overlay) != FALSE;
+    if (visible && (!topmost || isTopmost)) return;
+
+    SetWindowPos(g_overlay, topmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
 void OverlayRefresh() {
     if (!g_config.overlay) return;
-    // 手动放置后是独立状态条，不再属于任务栏，Explorer 重启也不重置位置。
-    if (!g_overlayDetached) {
-        HWND currentTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (!currentTaskbar) {
-            OverlayDestroy();
-            return;
-        }
-        if (!g_overlay || g_overlayTaskbar != currentTaskbar) {
-            OverlayDestroy();
-            g_overlayTaskbar = currentTaskbar;
-            OverlayCreate();
-        }
-    }
-    if (!g_overlay) return;
-    HWND taskbar = g_overlayDetached ? FindWindowW(L"Shell_TrayWnd", nullptr) : g_overlayTaskbar;
-    if (!g_overlayDetached && (!taskbar || !IsWindowVisible(taskbar))) {
-        ShowWindow(g_overlay, SW_HIDE);
+    // OverlayCreate 末尾会回调本函数；加锁避免同一轮重复提交与递归。
+    if (g_overlayRefreshing) return;
+    g_overlayRefreshing = true;
+    struct Guard {
+        ~Guard() { g_overlayRefreshing = false; }
+    } guard;
+
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    // 任务栏暂时找不到（Explorer 正在重启、锁屏切换、全屏应用接管）不代表浮窗该消失。
+    // 旧实现一次失败就 OverlayDestroy()，Explorer 每重启一次浮窗就没了；
+    // 这里连续失败超过阈值才重建，瞬时抖动直接跳过本轮。
+    if (!taskbar) {
+        if (++g_overlayTaskbarMiss < 10) return;
+        g_overlayTaskbarMiss = 0;
+        // 任务栏长时间不存在时才真正销毁；保留手动位置，恢复后仍回到用户放的地方。
+        const bool wasDetached = g_overlayDetached;
+        const int keepX = g_overlayX;
+        const int keepY = g_overlayY;
+        OverlayDestroy();
+        g_overlayDetached = wasDetached;
+        g_overlayX = keepX;
+        g_overlayY = keepY;
         return;
     }
+    g_overlayTaskbarMiss = 0;
+
+    if (!g_overlay || g_overlayTaskbar != taskbar) {
+        g_overlayTaskbar = taskbar;
+        OverlayRebuild();
+        if (!g_overlay) return;
+    }
+
+    // 竖向任务栏放不下横向宽条；此时只隐藏，不销毁，任务栏回到顶部/底部后自动回来。
+    APPBARDATA appbar{};
+    appbar.cbSize = sizeof(appbar);
+    appbar.hWnd = taskbar;
+    const UINT edge = SHAppBarMessage(ABM_GETTASKBARPOS, &appbar) ? appbar.uEdge : ABE_BOTTOM;
+    const bool vertical = !g_overlayDetached && (edge == ABE_LEFT || edge == ABE_RIGHT);
+    if (vertical) {
+        ShowWindow(g_overlay, SW_HIDE);
+        g_overlayCommitKey.clear();
+        return;
+    }
+
+    // 任务栏自身不可见（全屏游戏、锁屏、开始菜单过渡）时同样只隐藏。
+    // 这里也做去抖：连续多轮不可见才隐藏，避免 IsWindowVisible 的瞬时 false 让浮窗闪掉。
+    if (!g_overlayDetached && !IsWindowVisible(taskbar)) {
+        if (++g_overlayTaskbarHidden < 6) return;
+        ShowWindow(g_overlay, SW_HIDE);
+        g_overlayCommitKey.clear();
+        return;
+    }
+    g_overlayTaskbarHidden = 0;
+
     if (g_overlayDragging) return;
 
     RECT bar{};
-    GetWindowRect(taskbar, &bar);
-    RECT client{};
-    GetClientRect(taskbar, &client);
-    POINT origin{0, 0};
-    ClientToScreen(taskbar, &origin);
+    if (!GetWindowRect(taskbar, &bar)) return;
     // GetDpiForWindow 需要 Win10 1607+；早期 Win10 或失效窗口回退系统 DPI。
     g_overlayDpi = (int)GetDpiForWindow(taskbar);
     if (g_overlayDpi <= 0) g_overlayDpi = GetDpiForSystem();
     if (g_overlayDpi <= 0) g_overlayDpi = 96;
     const int width = OverlayWidth();
     const int barHeight = bar.bottom - bar.top;
+    if (barHeight <= 0) return;
     const int height = std::min(OverlayScale(36), barHeight);
-    APPBARDATA appbar{};
-    appbar.cbSize = sizeof(appbar);
-    appbar.hWnd = taskbar;
-    const UINT edge = SHAppBarMessage(ABM_GETTASKBARPOS, &appbar) ? appbar.uEdge : ABE_BOTTOM;
+
     const int rightSafe = bar.right - OverlayScale(330);
-    const int defaultX = rightSafe - width;
-    int x = defaultX;
+    int x = rightSafe - width;
     int y = bar.top + (barHeight - height) / 2;
-    if (!g_overlayDetached && (edge == ABE_LEFT || edge == ABE_RIGHT)) {
-        ShowWindow(g_overlay, SW_HIDE);
-        return;
-    }
-    if (!g_overlayDetached) {
-        // 任务栏点击/双击会改变 Explorer 内部窗口的前后关系；每次刷新仅恢复原位，
-        // 不反复隐藏、销毁窗口，也不把普通点击当成离开任务栏。
-        SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    } else if (!IsWindowVisible(g_overlay)) {
-        ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
-    }
-    // 默认留在任务栏；用户主动拖动后保持手动位置，不跟随鼠标自动移动。
     if (g_overlayDetached) {
         x = g_overlayX;
         y = g_overlayY;
-        HMONITOR monitor = MonitorFromPoint(POINT{x + width / 2, y + height / 2}, MONITOR_DEFAULTTONULL);
-        if (!monitor) {
-            // 拔掉显示器后把窗口放回主屏，避免无法再次抓住状态条。
-            monitor = MonitorFromPoint(POINT{bar.left + 1, bar.top + 1}, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi{};
-            mi.cbSize = sizeof(mi);
-            if (GetMonitorInfoW(monitor, &mi)) {
-                x = std::max((int)mi.rcWork.left, std::min(x, (int)mi.rcWork.right - width));
-                y = std::max((int)mi.rcWork.top, std::min(y, (int)mi.rcWork.bottom - height));
-            }
+        // 手动放置的位置始终夹在所在显示器的边界内（用 rcMonitor 而不是 rcWork，
+        // 允许压住任务栏，但不允许被拖到屏幕外只剩一条边——那样就再也抓不到了）。
+        HMONITOR monitor = MonitorFromPoint(POINT{x + width / 2, y + height / 2},
+                                           MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (monitor && GetMonitorInfoW(monitor, &mi)) {
+            x = std::max((int)mi.rcMonitor.left, std::min(x, (int)mi.rcMonitor.right - width));
+            y = std::max((int)mi.rcMonitor.top, std::min(y, (int)mi.rcMonitor.bottom - height));
         }
+        g_overlayX = x;
+        g_overlayY = y;
     }
+
+    // 先把窗口恢复成可见置顶，再提交内容；顺序反了会在不可见窗口上画，看着像"没显示"。
+    OverlayEnsureVisible(true);
+
     if (!OverlayEnsureSurface(width, height)) return;
 
     std::wstring contentKey = g_dark ? L"D;" : L"L;";
@@ -2284,29 +2345,110 @@ void OverlayRefresh() {
         contentKey += std::to_wstring((int)d.kind) + L":" + std::to_wstring(d.level) +
                       L":" + std::to_wstring(d.online ? 1 : 0) + L";";
     }
-    // 纯位置变化只移动窗口，不重建 DIB、不切换置顶状态，避免移动时闪烁。
-    // UpdateLayeredWindow 会提交一次完整位置，因此位置变化时仍需提交原缓存内容。
     const bool positionChanged = (x != g_overlayX || y != g_overlayY);
+    const bool sizeChanged = (width != g_overlayCommitW || height != g_overlayCommitH);
+    const bool contentChanged = (contentKey != g_overlayContentKey);
     if (positionChanged) {
-        SetWindowPos(g_overlay, nullptr, x, y, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         g_overlayX = x;
         g_overlayY = y;
     }
-    if (contentKey != g_overlayContentKey) {
+    if (contentChanged) {
         g_overlayContentKey = contentKey;
         std::memset(g_overlayBits, 0, (size_t)width * (size_t)height * 4);
         OverlayDraw(g_overlayDc, height);
     }
+    // 位置/尺寸/内容都没变就不再提交。旧实现每 200ms 无条件 UpdateLayeredWindow，
+    // 每次都重新合成整条浮窗，叠加上层 z 序变化就会出现"闪一下不见"。
+    if (!positionChanged && !sizeChanged && !contentChanged &&
+        g_overlayCommitKey == contentKey) {
+        return;
+    }
     POINT source{0, 0};
-    // Owned popup 使用屏幕坐标；owner 跟随任务栏，不占任务栏按钮、不抢前台。
-    (void)client;
-    (void)origin;
     POINT destination{x, y};
     SIZE size{width, height};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(g_overlay, nullptr, &destination, &size,
-                        g_overlayDc, &source, 0, &blend, ULW_ALPHA);
+    if (!UpdateLayeredWindow(g_overlay, nullptr, &destination, &size,
+                             g_overlayDc, &source, 0, &blend, ULW_ALPHA)) {
+        // 提交失败（Explorer 重建、桌面切换中）不销毁窗口，下一轮定时器会重试。
+        g_overlayCommitKey.clear();
+        return;
+    }
+    g_overlayCommitW = width;
+    g_overlayCommitH = height;
+    g_overlayCommitKey = contentKey;
+}
+
+// 主窗口看门狗：浮窗自己的定时器随窗口一起消失，一旦窗口被意外销毁就再没人重建它，
+// 这正是"浮窗时不时自动消失且不再回来"的根因。这里由常驻主窗口周期性兜底。
+void UiOverlayWatchdog() {
+    if (!g_config.overlay) return;
+    if (!g_overlay || !IsWindow(g_overlay)) {
+        // 统一走 OverlayRebuild：保留用户手动放置的位置，重建后不会跳到 (0,0)。
+        OverlayRebuild();
+        return;
+    }
+    OverlayRefresh();
+}
+
+// 拖动步进：按光标位置 + 左键状态推进。WM_MOUSEMOVE 和 WM_TIMER(2) 都调用它，
+// 所以即使鼠标捕获被系统收回（改 owner 必然发生），定时器也能接着把拖动走完。
+// 结束拖动不能只看一次按键状态：收到 LBUTTONUP 立刻结束；定时器则要求
+// 连续几拍都读到"已松开"才收尾，避免瞬时读数为 0 时把拖动误判为结束。
+void OverlayDragStep(HWND hwnd) {
+    if (!g_overlayDragging || !hwnd) return;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return;
+    // 阈值按"相对按下点"的累计位移判断；用每帧增量比阈值会导致慢速拖动永远拖不动。
+    if (!g_overlayDetached &&
+        (abs(cursor.x - g_overlayDragAnchor.x) >= GetSystemMetrics(SM_CXDRAG) ||
+         abs(cursor.y - g_overlayDragAnchor.y) >= GetSystemMetrics(SM_CYDRAG))) {
+        g_overlayDetached = true;
+        // SetWindowLongPtr 会同步派发 WM_CAPTURECHANGED；用标记让处理器忽略它。
+        g_overlayOwnChanging = true;
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+        g_overlayOwnChanging = false;
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    int newX = cursor.x - g_overlayDragOffset.x;
+    int newY = cursor.y - g_overlayDragOffset.y;
+    // 夹在屏幕内：允许压住任务栏，但不允许拖出可见区域（否则再也抓不回来）。
+    HMONITOR monitor = MonitorFromPoint(POINT{newX + g_overlayW / 2, newY + g_overlayH / 2},
+                                       MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (monitor && GetMonitorInfoW(monitor, &mi)) {
+        newX = std::max((int)mi.rcMonitor.left, std::min(newX, (int)mi.rcMonitor.right - g_overlayW));
+        newY = std::max((int)mi.rcMonitor.top, std::min(newY, (int)mi.rcMonitor.bottom - g_overlayH));
+    }
+    if (newX == g_overlayX && newY == g_overlayY) return;
+    g_overlayX = newX;
+    g_overlayY = newY;
+    SetWindowPos(hwnd, nullptr, g_overlayX, g_overlayY, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// 定时器兜底：只负责"按键仍按下时把拖动推下去 / 把丢失的捕获抢回来"。
+// 结束拖动只由 WM_LBUTTONUP 决定；定时器仅在"按键读数为松开"且"已经很久
+// 没收到任何鼠标消息"时才收尾——后者说明 LBUTTONUP 真的丢了（UAC、菜单弹出），
+// 用来防止 g_overlayDragging 永久卡在 true 导致浮窗停止刷新。
+void OverlayDragTick(HWND hwnd) {
+    if (!g_overlayDragging) return;
+    const ULONGLONG now = GetTickCount64();
+    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
+        g_overlayReleaseTicks = 0;
+        if (GetCapture() != hwnd) SetCapture(hwnd);
+        OverlayDragStep(hwnd);
+        return;
+    }
+    // 松开读数 + 最近 1.5s 内还有鼠标消息 → 视为仍在拖动，不动。
+    if (now - g_overlayLastMouseTick < 1500) return;
+    if (++g_overlayReleaseTicks < 10) return;
+    g_overlayReleaseTicks = 0;
+    g_overlayDragging = false;
+    KillTimer(hwnd, 2);
+    if (GetCapture() == hwnd) ReleaseCapture();
+    OverlayRefresh();
 }
 
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2334,48 +2476,57 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_overlay) return 0;
             POINT cursor{};
             if (!GetCursorPos(&cursor)) return 0;
-            g_overlayDragOffset.x = cursor.x - g_overlayX;
-            g_overlayDragOffset.y = cursor.y - g_overlayY;
+            // 用窗口真实位置算偏移，而不是缓存的 g_overlayX/Y：DPI 变化或
+            // 任务栏重排后缓存可能落后一帧，会表现为按下瞬间跳一下。
+            RECT rc{};
+            if (!GetWindowRect(hwnd, &rc)) return 0;
+            g_overlayX = rc.left;
+            g_overlayY = rc.top;
+            g_overlayDragOffset.x = cursor.x - rc.left;
+            g_overlayDragOffset.y = cursor.y - rc.top;
+            g_overlayDragAnchor = cursor;
             g_overlayDragging = true;
+            g_overlayReleaseTicks = 0;
+            g_overlayLastMouseTick = GetTickCount64();
             // 按下只记录拖动起点。真正移动超过系统拖动阈值后才脱离任务栏，
             // 单击、双击均不改变窗口 owner 或层级，避免状态条被任务栏盖住。
             SetCapture(hwnd);
+            // 拖动改由定时器驱动，不依赖鼠标捕获：把 owner 从任务栏改成桌面时
+            // 系统一定会收回捕获，靠 WM_MOUSEMOVE 续拖会在那一步断掉。
+            SetTimer(hwnd, 2, 15, nullptr);
             SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
             return 0;
         }
         case WM_MOUSEMOVE:
-            if (g_overlayDragging && (wp & MK_LBUTTON)) {
-                POINT cursor{};
-                if (!GetCursorPos(&cursor)) return 0;
-                const int newX = cursor.x - g_overlayDragOffset.x;
-                const int newY = cursor.y - g_overlayDragOffset.y;
-                if (!g_overlayDetached &&
-                    (abs(newX - g_overlayX) >= GetSystemMetrics(SM_CXDRAG) ||
-                     abs(newY - g_overlayY) >= GetSystemMetrics(SM_CYDRAG))) {
-                    g_overlayDetached = true;
-                    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
-                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
-                g_overlayX = newX;
-                g_overlayY = newY;
-                SetWindowPos(hwnd, nullptr, g_overlayX, g_overlayY, 0, 0,
-                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            } else if (g_overlayDragging) {
-                ReleaseCapture();
-                g_overlayDragging = false;
+            // 正常路径由这里推进；捕获丢失时定时器会接手，两条路径共用同一步进函数。
+            if (g_overlayDragging) {
+                g_overlayLastMouseTick = GetTickCount64();
+                if (wp & MK_LBUTTON) OverlayDragStep(hwnd);
             }
             return 0;
         case WM_LBUTTONUP:
-        case WM_CAPTURECHANGED:
             if (g_overlayDragging) {
                 g_overlayDragging = false;
+                KillTimer(hwnd, 2);
                 if (GetCapture() == hwnd) ReleaseCapture();
+                // 松手后统一走一次刷新：重新提交内容，并把窗口恢复为可见置顶。
                 OverlayRefresh();
             }
             return 0;
+        case WM_CAPTURECHANGED:
+            // 拖动中把 owner 从任务栏改成桌面，系统会同步收回一次鼠标捕获。
+            // 旧实现在这里直接结束拖动，于是拖动只在脱离任务栏那一步走一格就停住。
+            // 正确做法是：还在拖动就立刻把捕获抢回来，让后续 WM_MOUSEMOVE 继续送达。
+            if (g_overlayDragging && !g_overlayOwnChanging && GetCapture() != hwnd) {
+                SetCapture(hwnd);
+            }
+            return 0;
         case WM_TIMER:
-            if (wp == 1) OverlayRefresh();
+            if (wp == 1) {
+                OverlayRefresh();
+            } else if (wp == 2) {
+                OverlayDragTick(hwnd);
+            }
             return 0;
         case WM_SETTINGCHANGE:
         case WM_DISPLAYCHANGE:
@@ -2396,20 +2547,29 @@ void OverlayCreate() {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
-    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    HWND taskbar = g_overlayTaskbar ? g_overlayTaskbar : FindWindowW(L"Shell_TrayWnd", nullptr);
     if (!taskbar) return;
+    g_overlayTaskbar = taskbar;
+    // 默认贴在任务栏上的浮窗以任务栏为 **owner（不是 child）**。
+    // Win32 保证 owned window 始终位于 owner 之上；Explorer 点击、应用切换或
+    // 任务栏缩略图引起 z 序变化时，浮窗会随任务栏一起移动，不需要定时抢置顶。
+    // 用户拖出任务栏后 OverlayDragStep 会把 owner 清空，变成独立置顶浮窗。
     // 不使用 WS_EX_TRANSPARENT：它会从命中测试链中跳过整个窗口，导致无法主动拖动。
     // 真正透明的像素仍由逐像素 Alpha 呈现，窗口不抢焦点。
     g_overlay = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         OVERLAY_CLASS, L"余电任务栏电量", WS_POPUP,
         0, 0, OverlayScale(156), OverlayScale(36),
-        g_overlayTaskbar, nullptr, g_inst, nullptr);
+        g_overlayDetached ? nullptr : taskbar, nullptr, g_inst, nullptr);
     if (!g_overlay) return;
+    g_overlayCommitKey.clear();
+    g_overlayCommitW = g_overlayCommitH = 0;
+    g_overlayContentKey.clear();
     // 跟随任务栏自己的层级和显隐，不参与桌面前后台切换，避免点击后闪烁。
     SetWindowPos(g_overlay, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     OverlayRefresh();
+    // 只负责任务栏布局、显隐和内容提交；层级由 owner 关系维护，不在定时器里抢 z 序。
     SetTimer(g_overlay, 1, 200, nullptr);
 }
 
@@ -2417,6 +2577,7 @@ void OverlayDestroy() {
     g_overlayDragging = false;
     if (g_overlay) {
         KillTimer(g_overlay, 1);
+        KillTimer(g_overlay, 2);
         DestroyWindow(g_overlay);
         g_overlay = nullptr;
     }
@@ -2431,6 +2592,26 @@ void OverlayDestroy() {
     g_overlayX = g_overlayY = -1;
     g_overlayContentKey.clear();
     g_overlayTaskbar = nullptr;
+    // 下面这些是"防抖 / 防重复提交"状态，窗口重建后必须归零，
+    // 否则旧阈值会带到新窗口上，导致新一轮判断被提前跳过。
+    g_overlayTaskbarMiss = 0;
+    g_overlayTaskbarHidden = 0;
+    g_overlayCommitW = g_overlayCommitH = 0;
+    g_overlayCommitKey.clear();
+}
+
+// 重建浮窗但保留"用户手动放置过"的状态和坐标。
+// 旧实现每次重建都把 g_overlayX/Y 清成 -1，于是浮窗回到 (0,0) 或任务栏默认位——
+// 看起来就像"自己跑掉了"。所有重建路径都必须走这里。
+void OverlayRebuild() {
+    const bool wasDetached = g_overlayDetached;
+    const int keepX = g_overlayX;
+    const int keepY = g_overlayY;
+    OverlayDestroy();
+    g_overlayDetached = wasDetached;
+    g_overlayX = keepX;
+    g_overlayY = keepY;
+    OverlayCreate();
 }
 
 void UiSetOverlayVisible(bool visible) {

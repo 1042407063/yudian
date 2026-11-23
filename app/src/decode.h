@@ -54,6 +54,24 @@ int LogitechTrickleLevel(int base, uint64_t stableElapsedMs);
 // 距上次采样超过 30 分钟（设备关机 / 离场）时直接采用新值。
 int SmoothEstimatedLevel(int prev, int next, uint64_t elapsedMs);
 
+// ---------------- SinoWealth（中颖）2.4G 键盘私有协议
+//
+// 狼蛛（AULA）F87 等三模键盘的中颖 / Compx 接收器，在厂商集合上提供
+// 20 字节双向通道。实机验证的读取顺序是：
+//   1) 先被动听 200ms，设备可能主动推电量；
+//   2) 发握手 13 05 01 00 ... 00 19；
+//   3) 等 50ms，再发查询 13 4A 01 00 ... 00 5E；
+//   4) 应答以 13 4A 或 0A 为锚点，相对锚点 [5] 是电量，[6].bit4 是充电位。
+// 只发握手、或把 13 0A 当成唯一帧头并从固定下标 6 取电量，都会漏掉真实回包。
+constexpr int SINO_LEN = 20;
+
+// 组一帧握手 / 查询包（command = 0x05 / 0x4A）。返回 false 表示 outLen 装不下。
+bool BuildSinoQuery(uint8_t* out, int outLen, uint8_t command);
+
+// 解一帧回包。优先找 13 4A，找不到再找 0A；电量有效范围为 2..100，
+// 0/1 是未就绪或关机占位，不能当成真实低电量。charging 可为 nullptr。
+bool ParseSinoBattery(const uint8_t* frame, int len, int* level, int* charging);
+
 // 自检：跑一遍内置用例，把 TAP 结果写到 reportPath（UTF-8）。
 // 返回失败条数（0 = 全过），供 build.bat 当门禁用。
 int RunSelfTest(const std::wstring& reportPath);

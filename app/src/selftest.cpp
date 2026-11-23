@@ -202,6 +202,87 @@ void RunCases() {
     Check(L"Classify keyboard as Keyboard", ClassifyName(L"Bluetooth Keyboard") == Kind::Keyboard);
     Check(L"Unknown device remains Other", ClassifyName(L"USB Input Device") == Kind::Other);
 
+    // ---------------------------------------------- 狼蛛 F87 / 中颖 20 字节协议
+    {
+        uint8_t handshake[SINO_LEN];
+        uint8_t query[SINO_LEN];
+        Check(L"Sino handshake builds a 20-byte frame",
+              BuildSinoQuery(handshake, SINO_LEN, 0x05));
+        Check(L"Sino handshake starts with 13 05 01 and checksum 19",
+              handshake[0] == 0x13 && handshake[1] == 0x05 && handshake[2] == 0x01 &&
+              handshake[SINO_LEN - 1] == 0x19);
+        Check(L"Sino query starts with 13 4A 01 and checksum 5E",
+              BuildSinoQuery(query, SINO_LEN, 0x4A) &&
+              query[0] == 0x13 && query[1] == 0x4A && query[2] == 0x01 &&
+              query[SINO_LEN - 1] == 0x5E);
+        Check(L"Sino query refuses a short buffer",
+              !BuildSinoQuery(query, SINO_LEN - 1, 0x4A));
+        Check(L"Sino query refuses an unknown command",
+              !BuildSinoQuery(query, SINO_LEN, 0xFF));
+
+        // F87 实机形状：锚点 13 4A，相对锚点 [5]=电量，[6].bit4=充电。
+        std::vector<uint8_t> ok(SINO_LEN, 0);
+        ok[0] = 0x13; ok[1] = 0x4A; ok[2] = 0x01; ok[5] = 92; ok[6] = 0x10;
+        int lv = -1, ch = -1;
+        Check(L"Sino 13 4A reply parses 92% and charging",
+              ParseSinoBattery(ok.data(), (int)ok.size(), &lv, &ch) && lv == 92 && ch == 1);
+
+        std::vector<uint8_t> discharging = ok;
+        discharging[6] = 0;
+        ch = -1;
+        Check(L"Sino reply without bit 0x10 is discharging",
+              ParseSinoBattery(discharging.data(), (int)discharging.size(), &lv, &ch) && ch == 0);
+
+        // 前导 report ID 不影响锚点搜索。
+        std::vector<uint8_t> lead(SINO_LEN + 1, 0);
+        for (int i = 0; i < SINO_LEN; ++i) lead[i + 1] = ok[i];
+        lv = -1; ch = -1;
+        Check(L"Sino reply with a leading report ID still parses",
+              ParseSinoBattery(lead.data(), (int)lead.size(), &lv, &ch) && lv == 92 && ch == 1);
+
+        // 另一种实机应答只以 0A 为锚点，字段同样相对锚点。
+        std::vector<uint8_t> shortAnchor(SINO_LEN, 0);
+        shortAnchor[0] = 0x0A; shortAnchor[5] = 87; shortAnchor[6] = 0;
+        lv = -1;
+        Check(L"Sino 0A-only reply parses relative battery offset",
+              ParseSinoBattery(shortAnchor.data(), (int)shortAnchor.size(), &lv, &ch) && lv == 87);
+
+        // 旧版记录的 13 0A ... [6]=电量，可通过位于下标 1 的 0A 锚点兼容。
+        std::vector<uint8_t> legacy(SINO_LEN, 0);
+        legacy[0] = 0x13; legacy[1] = 0x0A; legacy[6] = 76;
+        lv = -1;
+        Check(L"Sino legacy 13 0A layout remains compatible",
+              ParseSinoBattery(legacy.data(), (int)legacy.size(), &lv, &ch) && lv == 76);
+
+        // 完整 13 4A 锚点优先于报文前部无关的 0A 字节。
+        std::vector<uint8_t> twoAnchors(SINO_LEN + 4, 0);
+        twoAnchors[0] = 0x0A; twoAnchors[5] = 33;
+        twoAnchors[7] = 0x13; twoAnchors[8] = 0x4A;
+        twoAnchors[12] = 76; twoAnchors[13] = 0x10;
+        lv = -1; ch = -1;
+        Check(L"Sino prefers the full 13 4A anchor over unrelated 0A",
+              ParseSinoBattery(twoAnchors.data(), (int)twoAnchors.size(), &lv, &ch) &&
+              lv == 76 && ch == 1);
+
+        std::vector<uint8_t> ack = ok;
+        ack[1] = 0x05;
+        Check(L"Sino handshake ack is not a battery packet",
+              !ParseSinoBattery(ack.data(), (int)ack.size(), &lv, &ch));
+
+        std::vector<uint8_t> bad = ok;
+        bad[5] = 200;
+        Check(L"Sino rejects an out-of-range level",
+              !ParseSinoBattery(bad.data(), (int)bad.size(), &lv, &ch));
+        bad[5] = 0;
+        Check(L"Sino rejects the zero offline placeholder",
+              !ParseSinoBattery(bad.data(), (int)bad.size(), &lv, &ch));
+        bad[5] = 1;
+        Check(L"Sino rejects the one not-ready placeholder",
+              !ParseSinoBattery(bad.data(), (int)bad.size(), &lv, &ch));
+        Check(L"Sino rejects a packet truncated before the charging byte",
+              !ParseSinoBattery(ok.data(), 6, &lv, &ch));
+    }
+
     // ---------------------------------------------- 双模外设：有线 + 无线去重
     auto Dup = [](const wchar_t* transport, int level, int charging) {
         Reading r;

@@ -293,6 +293,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UiRoundSystemMenus();
                 return 0;
             }
+            if (wp == 6) {                 // 浮窗看门狗（1s）
+                UiOverlayWatchdog();
+                return 0;
+            }
             break;
         case WM_DISPLAYCHANGE:
         case WM_DPICHANGED:
@@ -772,6 +776,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     g_intervalSec = g_config.interval;
     UiCreate();
     UiSetAutostart(AutostartGet());
+    // 浮窗看门狗：浮窗自己的 200ms 定时器随窗口一起消失，一旦窗口被系统销毁
+    // 就再没人重建它。由常驻主窗口每秒兜底检查一次，保证浮窗总能自己回来。
+    SetTimer(g_mainWnd, 6, 1000, nullptr);
 
     g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_scanThread = CreateThread(nullptr, 0, ScanThreadProc, nullptr, 0, nullptr);

@@ -9,6 +9,7 @@
 #include "logitech_powermodel.h"   // G913 TKL 官方充放电曲线（取自 G HUB 资源）
 
 #include <setupapi.h>
+#include <hidsdi.h>
 #include <bthledef.h>
 
 #include <algorithm>
@@ -49,6 +50,7 @@ struct ProviderDesc {
 
 constexpr uint16_t LOGITECH_VID = 0x046D;
 constexpr uint16_t SONY_VID = 0x054C;
+constexpr uint16_t RAPOO_VID = 0x24AE;
 
 constexpr uint8_t FEAT_ROOT = 0x00;
 constexpr uint8_t FUNC_GET_FEATURE = 0x00;
@@ -119,6 +121,12 @@ Kind ClassifyName(const std::wstring& name) {
 }
 
 namespace {
+
+// 狼蛛 / 中颖键盘的识别条件。定义在文件后面（它依赖 CleanProductName 等），
+// 但 --dump 诊断在中间就要用，所以先在这里声明。
+bool LooksLikeAula(const HidInfo& d);
+// 中颖电量通道的接口形状判据（不看 VID）。同样后面才定义，先声明。
+bool LooksLikeSinoChannel(const HidInfo& d);
 
 // 0x0005 报的是完整市场名。G913 TKL 会回 58 字符的
 // "G913 TKL LIGHTSPEED Wireless RGB Mechanical Gaming Keyboard"，面板里只剩省略号。
@@ -1356,6 +1364,11 @@ void ScanCompx(const ScanCtx& ctx, std::vector<Reading>* out) {
     for (const auto& d : all) {
         if (IsNordic54(d.vid, d.pid)) continue;
         if (!IsCompxCandidate(d)) continue;
+        // 已被更高优先级链路认领的接口不再重复处理。
+        // 狼蛛键盘的接收器常常就是 0x3554（同一批 Compx 硬件），但命令字不同，
+        // 这里必须让位，否则同一台键盘会出两条记录、其中一条永远读不到电量。
+        auto it = ctx.owner->find(d.path);
+        if (it != ctx.owner->end() && lstrcmpW(it->second->id, L"compx") != 0) continue;
         groups[StripSuffix(d.path, L"&col")].push_back(d);
     }
 
@@ -2031,6 +2044,15 @@ std::wstring DumpHidImpl() {
             } else {
                 tag = L"迈从（非厂商集合）";
             }
+        } else if (LooksLikeAula(d)) {
+            tag = (d.usagePage == 0xFF02 && d.usage == 0x0002 && d.inputLen >= SINO_LEN)
+                      ? L"狼蛛（中颖 13 05 + 13 4A）"
+                      : L"狼蛛（非厂商集合）";
+        } else if (LooksLikeSinoChannel(d) && d.vid != RAPOO_VID) {
+            // 名字看不出来、但接口形状符合中颖电量通道。
+            // 这是给别人电脑排查时最有价值的一行：说明这台设备「可能」是狼蛛，
+            // 程序会在扫描时真发一帧去确认。
+            tag = L"疑似中颖通道（形状匹配）";
         } else if (d.vid == SONY_VID) {
             bool bt = (TransportOf(d.path, d.product) == L"蓝牙");
             tag = bt ? L"索尼手柄（蓝牙·无电量）" : L"索尼手柄（USB）";
@@ -2356,6 +2378,46 @@ int LogitechBatteryPercent(int millivolts, bool full) {
     return LogitechVoltageToPercent(millivolts);
 }
 
+// ---------------- SinoWealth（中颖）键盘私有协议：纯函数
+
+bool BuildSinoQuery(uint8_t* out, int outLen, uint8_t command) {
+    if (!out || outLen < SINO_LEN) return false;
+    if (command != 0x05 && command != 0x4A) return false;
+    memset(out, 0, (size_t)SINO_LEN);
+    out[0] = 0x13;       // 报文 ID
+    out[1] = command;    // 0x05 = 握手 / 唤醒，0x4A = 查询电量
+    out[2] = 0x01;
+    // 末字节是前 19 字节求和的低 8 位：握手 0x19，查询 0x5E。
+    unsigned sum = 0;
+    for (int i = 0; i < SINO_LEN - 1; ++i) sum += out[i];
+    out[SINO_LEN - 1] = (uint8_t)sum;
+    return true;
+}
+
+bool ParseSinoBattery(const uint8_t* frame, int len, int* level, int* charging) {
+    if (!frame || len < 7) return false;
+
+    // 实机回包有两种锚点：完整的 13 4A，或单独的 0A。锚点不一定位于
+    // 缓冲区开头（可能有前导 report ID），电量与充电位都相对锚点取值。
+    int base = -1;
+    for (int i = 0; i + 1 < len; ++i) {
+        if (frame[i] == 0x13 && frame[i + 1] == 0x4A) { base = i; break; }
+    }
+    if (base < 0) {
+        for (int i = 0; i < len; ++i) {
+            if (frame[i] == 0x0A) { base = i; break; }
+        }
+    }
+    if (base < 0 || base + 6 >= len) return false;
+
+    const int pct = frame[base + 5];
+    // F87 实测协议把 0/1 用作未就绪 / 关机占位，不是可显示的电池百分比。
+    if (pct < 2 || pct > 100) return false;
+    if (level) *level = pct;
+    if (charging) *charging = (frame[base + 6] & 0x10) ? 1 : 0;
+    return true;
+}
+
 namespace {
 
 // 单调表线性插值。表里的 pct10 是 0.1% 单位，返回同样单位。
@@ -2445,7 +2507,7 @@ namespace {
 //
 // 所以这里不做"读取"，只把它列出来并说明为什么没有数字。不列的话，用户会以为
 // 程序没认出设备。和罗技 C542 那一代接收器是同一类处理。
-const uint16_t RAPOO_VID = 0x24AE;
+// （VID 常量已提到文件顶部的常量区，--dump 也要用。）
 
 void ScanRapoo(const ScanCtx& ctx, std::vector<Reading>* out) {
     const std::vector<HidInfo>& all = *ctx.all;
@@ -2486,6 +2548,259 @@ void ScanRapoo(const ScanCtx& ctx, std::vector<Reading>* out) {
     }
 }
 
+// ---------------------------------------------------------------- 狼蛛 AULA
+//
+// F87（3554:FA09）的实机验证流程不是单帧查询：先被动听 200ms，再发
+// 13 05 01 握手，等 50ms 后发 13 4A 01 查询。两个请求都是 20 字节，
+// 末字节为前 19 字节求和。应答以 13 4A 或 0A 为锚点，相对锚点 [5]
+// 是电量，[6] 的 0x10 位表示充电；0/1 是未就绪 / 关机占位。
+//
+// 其它采用同一中颖 / Compx 通道的狼蛛型号也走这条实现，但必须由接口形状
+// 和真实应答确认，不能仅凭 VID 把任意 20 字节设备当成狼蛛。
+constexpr uint16_t AULA_VID = 0x258A;
+
+// 品牌名和已知型号兜底：接收器产品名经常只有 "2.4G Receiver"。
+bool LooksLikeAula(const HidInfo& d) {
+    if (d.vid == AULA_VID) return true;
+    if (d.vid == 0x3554 && d.pid == 0xFA09) return true;   // F87 实机身份
+    std::wstring s = Lower(d.product + L" " + d.manufacturer);
+    return s.find(L"aula") != std::wstring::npos ||
+           s.find(L"狼蛛") != std::wstring::npos;
+}
+
+// 在厂商集合上执行完整的「被动监听 → 握手 → 查询」流程。
+// 返回 true = 本轮拿到有效电量；charging 回传同一应答里的充电位。
+//
+// 三个底层约束仍然成立：
+//
+// 1. **写和读不能用同一个句柄**。HidDevice 内部是 FILE_FLAG_OVERLAPPED，
+//    在同一个异步句柄上既 WriteFile 又 ReadFile，输入报告会静默丢弃，
+//    现象就是接收器明明连着、却永远等不到有效应答（看着像设备休眠）。
+//    迈从 V2 / 飞智都是「同步句柄写 + 异步句柄读」，这里必须一致。
+// 2. **写入长度要按 OutputReportByteLength**，不能写死 SINO_LEN。
+//    Windows 对 HID 写入的长度是严格的：多一个字节少一个字节都返回 87
+//    （ERROR_INVALID_PARAMETER），而返回值只看 <0 的话就成了静默失败。
+// 3. **解析要按锚点搜索**。有的固件回包带前导 report ID，
+//    锚点不一定在缓冲区开头；按固定下标 0 匹配会漏掉有效回包。
+bool AulaAsk(const std::wstring& path, int* level, int* charging) {
+    HidDevice reader;                       // 异步句柄：只负责读
+    if (!reader.Open(path)) return false;
+
+    int wire = reader.info().outputLen;
+    if (wire < SINO_LEN || wire > 256) return false;
+    int readLen = std::max<int>(SINO_LEN, reader.info().inputLen);
+    if (readLen > 256) readLen = 256;
+    uint8_t buf[256];
+
+    auto offer = [&](const uint8_t* data, int n) {
+        int lv = -1, ch = 0;
+        if (!ParseSinoBattery(data, n, &lv, &ch)) return false;
+        if (level) *level = lv;
+        if (charging) *charging = ch;
+        return true;
+    };
+
+    // 0) 有些固件会主动推电量。这里必须解析，不能像旧实现那样把打开前
+    //    积压的报告全部丢掉——被丢掉的往往正是唯一一条有效状态包。
+    const ULONGLONG passiveDeadline = GetTickCount64() + 200;
+    while (GetTickCount64() < passiveDeadline) {
+        if (ScanCancelRequested()) return false;
+        const int n = reader.Read(buf, (DWORD)readLen, 40);
+        if (n > 0 && offer(buf, n)) return true;
+    }
+
+    // 同步句柄只负责写；读写共用一个异步句柄在部分接收器上会丢输入报告。
+    HANDLE writer = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (writer == INVALID_HANDLE_VALUE) return false;
+    auto finish = [&](bool ok) { CloseHandle(writer); return ok; };
+
+    uint8_t handshake[256] = {0};
+    uint8_t query[256] = {0};
+    if (!BuildSinoQuery(handshake, wire, 0x05) ||
+        !BuildSinoQuery(query, wire, 0x4A)) {
+        return finish(false);
+    }
+
+    // 1) 握手 / 唤醒。个别 HID 驱动只接受 SetOutputReport，因此写失败时
+    //    允许换控制通道，但仍使用同一个 OutputReportByteLength。
+    DWORD written = 0;
+    BOOL sent = WriteFile(writer, handshake, (DWORD)wire, &written, nullptr);
+    if ((!sent || written != (DWORD)wire) &&
+        !HidD_SetOutputReport(writer, handshake, (ULONG)wire)) {
+        return finish(false);
+    }
+
+    // 2) 固件需要约 50ms 建立会话；握手回执可以留在队列里，解析器会跳过。
+    Sleep(50);
+
+    // 3) 正常走 WriteFile。若无有效应答，再按 HID 自动回退规则用
+    //    SetOutputReport 发同一查询；每种通道最多听 600ms，不反复敲门。
+    for (int mode = 0; mode < 2; ++mode) {
+        written = 0;
+        sent = FALSE;
+        if (mode == 0) {
+            sent = WriteFile(writer, query, (DWORD)wire, &written, nullptr);
+            if (sent && written != (DWORD)wire) sent = FALSE;
+        } else {
+            sent = HidD_SetOutputReport(writer, query, (ULONG)wire);
+        }
+        if (!sent) continue;
+
+        const ULONGLONG deadline = GetTickCount64() + 600;
+        while (GetTickCount64() < deadline) {
+            if (ScanCancelRequested()) return finish(false);
+            const int n = reader.Read(buf, (DWORD)readLen, 60);
+            if (n > 0 && offer(buf, n)) return finish(true);
+        }
+    }
+    return finish(false);
+}
+
+// 中颖方案的通道长得什么样（不看 VID，只看接口形状）。
+//
+// 狼蛛/迈从/达摩鲨这一批国产三模键盘的接收器，电量都走同一条私有通道：
+// 厂商页（0xFF00~0xFF0A）上的 20 字节双向报文。VID 随批次变（0x258A、0x3554…），
+// 产品名也常常只报 "2.4G Receiver"，所以**按 VID 或名字认设备一定会漏**。
+// 真正稳定的特征是这个接口形状。
+bool LooksLikeSinoChannel(const HidInfo& d) {
+    if (d.usagePage < 0xFF00 || d.usagePage > 0xFF0A) return false;
+    if (d.inputLen < SINO_LEN || d.outputLen < SINO_LEN) return false;
+    return true;
+}
+
+// 这个接口有没有被别的链路认领（罗技/索尼等更具体的链路优先）。
+bool ClaimedByOther(const ScanCtx& ctx, const HidInfo& d, const wchar_t* selfId) {
+    auto it = ctx.owner->find(d.path);
+    if (it == ctx.owner->end()) return false;
+    return lstrcmpW(it->second->id, selfId) != 0;
+}
+
+// 形状匹配接口的探测状态。succeededAt 用于在临时无应答时保留已确认设备，
+// retryAt 只限制失败重试，不能把成功的电量缓存 10 分钟再冒充本轮新读数。
+struct SinoProbe {
+    ULONGLONG succeededAt = 0;
+    ULONGLONG retryAt = 0;
+};
+std::map<std::wstring, SinoProbe> g_sinoProbe;
+
+// 非命名设备每轮最多执行一次完整读取，并直接把本轮电量 / 充电状态带回。
+// 旧实现这里先探测一次、成功后再 AulaAsk 一次，第二次超时会把第一次的
+// 有效电量一起丢掉。known 表示它最近曾通过真实应答确认过协议。
+bool ProbeSinoChannel(const std::wstring& path, int* level, int* charging, bool* known) {
+    SinoProbe& probe = g_sinoProbe[path];
+    const ULONGLONG now = GetTickCount64();
+    const bool identified = probe.succeededAt != 0 && now - probe.succeededAt < 600000;
+    if (known) *known = identified;
+    if (now < probe.retryAt) return false;
+
+    int lv = -1, ch = 0;
+    const bool ok = AulaAsk(path, &lv, &ch);
+    if (ok) {
+        probe.succeededAt = now;
+        probe.retryAt = 0;
+        if (level) *level = lv;
+        if (charging) *charging = ch;
+        if (known) *known = true;
+    } else {
+        probe.retryAt = now + 60000;
+    }
+    return ok;
+}
+
+void ScanAula(const ScanCtx& ctx, std::vector<Reading>* out) {
+    const std::vector<HidInfo>& all = *ctx.all;
+
+    // 收集候选：
+    //   1) 名字/VID 明确是狼蛛的接口——直接算候选，不必探测；
+    //   2) 形状像中颖通道、又没被别的链路认领的接口——需要探测确认。
+    // 第 2 条是给"别人的电脑"用的：那台机器上的狼蛛 VID 和产品名我们事先不知道。
+    std::map<std::wstring, std::vector<const HidInfo*>> groups;
+    std::map<std::wstring, bool> groupNamed;      // 该组是否靠名字认出来的
+    for (const auto& d : all) {
+        if (ClaimedByOther(ctx, d, L"aula")) continue;
+        const bool named = LooksLikeAula(d);
+        const bool shaped = LooksLikeSinoChannel(d);
+        if (!named && !shaped) continue;
+        const std::wstring id = DeviceIdentity(d);
+        groups[id].push_back(&d);
+        if (named) groupNamed[id] = true;
+    }
+
+    for (auto& kv : groups) {
+        const bool named = groupNamed[kv.first];
+        const HidInfo* vendorSet = nullptr;   // 能读电量的厂商集合
+        const HidInfo* repr = nullptr;        // 用来取名字/判断品类
+        // 优先找标准的 0xFF02/0x0002（中颖键盘的常规布局）；
+        // 找不到就退一步，任何厂商页（0xFF00~0xFF0A）且能容纳 20 字节的集合都试。
+        // 固件版本不同会换 usage 值，写死 0x0002 会让一部分接收器直接「没集合可问」。
+        const HidInfo* fallbackSet = nullptr;
+        for (const HidInfo* d : kv.second) {
+            if (!vendorSet && d->usagePage == 0xFF02 && d->usage == 0x0002 &&
+                d->inputLen >= SINO_LEN && d->outputLen >= SINO_LEN) {
+                vendorSet = d;
+            }
+            if (!fallbackSet && d->usagePage >= 0xFF00 && d->usagePage <= 0xFF0A &&
+                d->inputLen >= SINO_LEN && d->outputLen >= SINO_LEN) {
+                fallbackSet = d;
+            }
+            if (!repr && !d->product.empty()) repr = d;
+        }
+        if (!vendorSet) vendorSet = fallbackSet;
+        if (!repr) repr = kv.second.front();
+
+        // 命名设备直接读；形状匹配设备由 ProbeSinoChannel 读取并确认。
+        // 两条路径都只调用一次硬件读取，且都保留本次读到的数值。
+        int lv = -1, ch = 0;
+        bool known = named;
+        bool got = false;
+        if (vendorSet) {
+            got = named ? AulaAsk(vendorSet->path, &lv, &ch)
+                        : ProbeSinoChannel(vendorSet->path, &lv, &ch, &known);
+        }
+        // 从未回应过的形状候选静默跳过；已经确认过的设备暂时无应答时保留
+        // 占位，让通用 MergeReading 在 15 分钟内沿用旧值并明确标为缓存。
+        if (!named && !got && !known) continue;
+
+        Reading r;
+        r.key = L"aula:" + kv.first;
+        std::wstring name = CleanProductName(repr->product);
+        // 接收器常报成 "2.4G Wireless Receiver" 这种通用名，看不出品牌。
+        // 这种情况补上品牌，否则面板里一堆无名设备分不清谁是谁。
+        if (name.empty() || Lower(name).find(L"receiver") != std::wstring::npos ||
+            Lower(name).find(L"接收器") != std::wstring::npos) {
+            name = L"狼蛛无线键盘";
+        }
+        r.name = name;
+        // 接收器常报成 "2.4G Wireless Receiver" 这种通用名，品类靠名字猜不准，
+        // 但这条链路只服务键盘，直接标 Keyboard。
+        r.kind = Kind::Keyboard;
+        r.vendor = L"狼蛛";
+        r.transport = L"2.4G 接收器";
+        r.provider = L"aula";
+        r.level = -1;
+        r.charging = -1;
+
+        if (got) {
+            r.level = lv;
+            r.charging = ch;
+            r.status = (ch == 1) ? L"充电中" : L"放电中";
+            r.detail = L"中颖 / Compx 私有协议 · 13 05 握手 + 13 4A 查询";
+            r.outcome = Outcome::Ok;
+        } else {
+            // 明确兜底：保留设备和 --，绝不把无应当成 0%，也不伪造新读数。
+            // 若存在 15 分钟内的历史值，MergeReading 会沿用并标 stale / 采样时间。
+            r.status = L"暂未读取";
+            r.detail = L"本轮未收到有效的 13 4A / 0A 电量应答。请敲键唤醒后刷新；"
+                       L"若持续无应答，则该型号、当前连接方式或接口不提供已支持的"
+                       L"电量通道，程序保留设备占位但不生成估算值。";
+            r.outcome = Outcome::NoReply;
+        }
+        out->push_back(r);
+    }
+}
+
 // ---------------------------------------------------------------- 链路表
 //
 // claims：这台接口归不归我。先到先得，所以表里的顺序就是优先级。
@@ -2502,6 +2817,25 @@ bool ClaimsNordic(const HidInfo& d) { return IsNordic54(d.vid, d.pid); }
 bool ClaimsRapoo(const HidInfo& d) { return d.vid == RAPOO_VID; }
 bool ClaimsMchose(const HidInfo& d) { return LooksLikeMchose(d); }
 bool ClaimsFlydigi(const HidInfo& d) { return LooksLikeFlydigi(d); }
+// 狼蛛的认领条件。两层：
+//   1) 名字/VID 明确是狼蛛 —— 直接认领；
+//   2) 形状像中颖通道、又不是已知其它品牌的 —— 也认领，交给 ScanAula 去探测。
+// 第 2 层是为了「别人的电脑」：那边狼蛛的 VID 和产品名我们事先不知道，
+// 只能靠接口形状 + 完整握手 / 查询，看有没有有效电量应答。
+// 认领了但不回应的，ScanAula 会静默跳过，不会在面板里留噪声。
+bool ClaimsAula(const HidInfo& d) {
+    if (LooksLikeAula(d)) return true;
+    if (!LooksLikeSinoChannel(d)) return false;
+    // 已知其它品牌的设备不要抢：它们各有专用链路，抢过来反而读不到。
+    if (LooksLikeMchose(d) || LooksLikeFlydigi(d)) return false;
+    if (d.vid == LOGITECH_VID || d.vid == SONY_VID || d.vid == RAPOO_VID) return false;
+    // Compx 家族的已知 VID（VGN/VXE/ATK/蜻蜓…）走 17 字节鼠标协议，不要抢。
+    // 注意：狼蛛自己也常用 0x3554，所以这条只挡住"名字明显是别家"的情况，
+    // 名字认不出时才靠形状探测——那种情况下 17 字节设备本来就进不来
+    // （LooksLikeSinoChannel 要求 IN/OUT 都 >= 20）。
+    if (IsCompxVendor(d.vid) && IsCompxCandidate(d) && d.inputLen < SINO_LEN) return false;
+    return true;
+}
 
 // 罗技是两条函数：HID++ 通道 + "这代硬件不支持"的说明行
 void ScanLogitechAll(const ScanCtx& ctx, std::vector<Reading>* out) {
@@ -2570,6 +2904,12 @@ const ProviderDesc kProviders[] = {
     // 顺序 = 优先级。越具体的越靠前。
     {L"logitech", L"罗技", ClaimsLogitech, true, ScanLogitechAll},
     {L"sony", L"索尼", ClaimsSony, true, ScanSony},
+    // 狼蛛必须排在「厂商接收器」之前。
+    // 狼蛛键盘的接收器 VID 常常就是 0x3554（和 VGN/VXE 同一批 Compx 接收器），
+    // 而 0x3554 在 kCompxVids 里。若把 compx 排在前面，这台键盘会被 compx 抢先
+    // 认领，用 17 字节的鼠标命令去问，键盘不认，结果是「设备列出来了但电量读不到」。
+    // 按名字能明确认出狼蛛时，就该走中颖 13 05 + 13 4A 那条链路。
+    {L"aula", L"狼蛛", ClaimsAula, true, ScanAula},           // 中颖 13 05 + 13 4A
     {L"compx", L"厂商接收器", ClaimsCompx, true, ScanCompx},
     {L"nordic54", L"ATK", ClaimsNordic, true, ScanNordic54},
     {L"mchose", L"迈从", ClaimsMchose, true, ScanMchose},
@@ -2725,6 +3065,40 @@ void MonitorScan(std::vector<Reading>* out) {
         }
     }
 
+    // 二级修正：一颗接收器会暴露好几个 HID 集合（键盘/鼠标/厂商页），
+    // 品牌名往往只出现在其中一两个集合上。若按集合各自认领，就会出现
+    // "同一个接收器被两条链路各认走一部分"，最后出两条记录、其中一条读不到。
+    // 这里按物理设备（ContainerId）统一：只要该设备有任一集合被某条链路认领，
+    // 整台设备就都归这条链路——取优先级最高的那个。
+    {
+        std::map<std::wstring, const ProviderDesc*> deviceOwner;   // 设备 → 链路
+        std::map<std::wstring, int> deviceRank;                    // 设备 → 该链路的下标
+        for (const auto& kv : owner) {
+            // 找出这条 path 属于哪台设备
+            const HidInfo* hit = nullptr;
+            for (const auto& d : all) {
+                if (d.path == kv.first) { hit = &d; break; }
+            }
+            if (!hit) continue;
+            const std::wstring id = DeviceIdentity(*hit);
+            int rank = 0;
+            for (int i = 0; i < kProviderCount; ++i) {
+                if (&kProviders[i] == kv.second) { rank = i; break; }
+            }
+            auto it = deviceRank.find(id);
+            if (it == deviceRank.end() || rank < it->second) {
+                deviceRank[id] = rank;
+                deviceOwner[id] = kv.second;
+            }
+        }
+        for (const auto& d : all) {
+            const std::wstring id = DeviceIdentity(d);
+            auto it = deviceOwner.find(id);
+            if (it == deviceOwner.end()) continue;
+            owner[d.path] = it->second;      // 整台设备统一归最高优先级的链路
+        }
+    }
+
     ScanCtx ctx{&all, &owner, g_fullSweep};
 
     int total = 0, readable = 0;
@@ -2842,6 +3216,56 @@ std::wstring VendorDiagnostics() {
 
     if (candidates == 0) {
         out = L"未发现 Compx / VGN 厂商集合（0xFF02/0x0002，17 字节进出）\n";
+    }
+
+    // ---- 狼蛛（中颖 13 05 + 13 4A）单独一段 ----
+    // 狼蛛和 Compx 鼠标可共用接收器硬件，但狼蛛需要 13 05 握手后再发 13 4A 查询。
+    // 这里不靠 VID 或产品名筛选，而是把所有「形状像中颖通道」的接口都试一遍，
+    // 这样在别人电脑上（VID 和产品名都未知）也能定位问题。
+    {
+        std::vector<HidInfo> candidates;
+        for (const auto& d : all) {
+            if (LooksLikeAula(d)) {
+                candidates.push_back(d);        // 名字/VID 命中，一定要试
+                continue;
+            }
+            if (!LooksLikeSinoChannel(d)) continue;
+            // 已知其它品牌的厂商接口不要列进来：罗技/雷柏/迈从/飞智/索尼
+            // 都有自己的厂商页和 20 字节以上的报文，形状和中颖通道一样，
+            // 但协议完全不同。列进来只会让诊断日志变得难读。
+            if (d.vid == LOGITECH_VID || d.vid == SONY_VID || d.vid == RAPOO_VID) continue;
+            if (LooksLikeMchose(d) || LooksLikeFlydigi(d)) continue;
+            if (IsCompxVendor(d.vid)) continue;
+            candidates.push_back(d);
+        }
+        out += L"\n================ 狼蛛 AULA（中颖 13 05 + 13 4A） ================\n";
+        if (candidates.empty()) {
+            out += L"没有找到符合中颖通道特征的接口。\n"
+                   L"判据：厂商页 0xFF00~0xFF0A，且 IN/OUT 都不少于 20 字节。\n"
+                   L"若确认键盘已插好，把上面 --dump 的完整列表发出来，可能是\n"
+                   L"这颗接收器的接口形状不同（需要按实际形状补一条识别规则）。\n";
+        }
+        for (const auto& d : candidates) {
+            wchar_t head[512];
+            swprintf(head, 512,
+                     L"接口: %ls\n  VID:PID %04X:%04X  用法 %04X/%04X  报文 IN %u / OUT %u\n"
+                     L"  产品名: %ls\n  识别: %ls\n",
+                     d.path.c_str(), d.vid, d.pid, d.usagePage, d.usage,
+                     d.inputLen, d.outputLen,
+                     d.product.empty() ? L"（无）" : d.product.c_str(),
+                     LooksLikeAula(d) ? L"名字/VID 命中狼蛛" : L"仅接口形状匹配");
+            out += head;
+            int lv = -1, ch = -1;
+            if (AulaAsk(d.path, &lv, &ch)) {
+                swprintf(head, 512, L"  -> 探测成功：电量 %d%%，充电状态 %d\n", lv, ch);
+                out += head;
+            } else {
+                out += L"  -> 探测失败：未收到有效的 13 4A / 0A 电量应答\n"
+                       L"     常见原因：键盘深度休眠（敲键唤醒再试）、接口选错、\n"
+                       L"     或当前型号 / 连接方式不提供这条电量通道。\n";
+            }
+            out += L"\n";
+        }
     }
     return out;
 }

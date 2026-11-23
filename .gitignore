@@ -8,18 +8,76 @@ app/build/
 *.ilk
 *.exp
 *.lib
+*.a
+*.d
+*.dll
+*.so
+*.dylib
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
 
-# Python 缓存（dev/probes）
+# Python 缓存与测试工具（dev/probes）
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.egg-info/
 
-# 运行时 / 本地状态
+# 测试与覆盖率输出（文档中有意保留的截图、记录不受影响）
+test-results/
+*.tap
+*.trx
+junit*.xml
+
+# 运行时 / 本地状态与临时文件
 *.log
+*.log.*
 *.tmp
+*.temp
+*.swp
+*.swo
+*.orig
+*.rej
+logs/
 Thumbs.db
+ehthumbs.db
+Desktop.ini
 .DS_Store
+$RECYCLE.BIN/
+System Volume Information/
+
+# 编辑器 / IDE 缓存（共享的 .vscode 配置和 .idea 项目配置不整目录忽略）
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+.clangd/
+.vscode/ipch/
+.vscode/.browse.c_cpp.db*
+.idea/workspace.xml
+.idea/shelf/
+.idea/tasks.xml
+.idea/usage.statistics.xml
+.idea/caches/
 
 # WorkBuddy 本地状态与历史备份
 .workbuddy/settings.local.json
